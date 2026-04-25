@@ -12,6 +12,10 @@
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
     "paths": {
       "@/*": ["./src/*"]
+      // Local-source path for @galvanized-pukeko/vue-ui — uncomment when also
+      // uncommenting the matching alias in `vite.config.ts` to iterate on the
+      // vue-ui source in `_refs/` without re-publishing.
+      // "@galvanized-pukeko/vue-ui": ["./_refs/galvanized-pukeko-ai-ui/packages/galvanized-pukeko-vue-ui/src/index.ts"]
     }
   }
 }

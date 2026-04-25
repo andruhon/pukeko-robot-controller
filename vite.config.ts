@@ -15,18 +15,21 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
-      '@galvanized-pukeko/vue-ui/style.css': fileURLToPath(
-        new URL(
-          '_refs/galvanized-pukeko-ai-ui/packages/galvanized-pukeko-vue-ui/src/assets/global.css',
-          import.meta.url,
-        ),
-      ),
-      '@galvanized-pukeko/vue-ui': fileURLToPath(
-        new URL(
-          '_refs/galvanized-pukeko-ai-ui/packages/galvanized-pukeko-vue-ui/src',
-          import.meta.url,
-        ),
-      ),
+      // Local-source aliases for @galvanized-pukeko/vue-ui — useful when iterating
+      // on the vue-ui source in `_refs/galvanized-pukeko-ai-ui/` without re-publishing.
+      // Uncomment together with the matching entry in `tsconfig.app.json` `paths`.
+      // '@galvanized-pukeko/vue-ui/style.css': fileURLToPath(
+      //   new URL(
+      //     '_refs/galvanized-pukeko-ai-ui/packages/galvanized-pukeko-vue-ui/src/assets/global.css',
+      //     import.meta.url,
+      //   ),
+      // ),
+      // '@galvanized-pukeko/vue-ui': fileURLToPath(
+      //   new URL(
+      //     '_refs/galvanized-pukeko-ai-ui/packages/galvanized-pukeko-vue-ui/src',
+      //     import.meta.url,
+      //   ),
+      // ),
     },
   },
   server: {

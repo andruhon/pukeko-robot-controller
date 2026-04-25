@@ -1,5 +1,16 @@
 # Webcam → Vision via `capture_image` Tool
 
+> **Status: implemented (2026-04-26).**
+> Shipped via:
+> - `@gaunt-sloth/core@0.0.4` — `metadata.client === true` interrupt-wrapping in `extractAndFlattenTools`, `streamWithEventsResume`, `GraphInterrupt` handling in `streamWithEvents`.
+> - `@gaunt-sloth/api@0.0.3` — `forwardedProps.command.resume` routing in `apiAgUiModule`, `express.json` body limit raised to 5 MB.
+> - `@galvanized-pukeko/vue-ui@0.0.4` — `clientTools` / `clientToolHandlers` props on `ChatInterface`, `chatService.resumeWithCommand`, `onRunStart` callback.
+> - This repo: `server/index.ts` boots gaunt-sloth as a library; `src/agent/captureImageTool.ts` and `src/agent/frontendImageInjectionMiddleware.ts` carry the robot-specific tool and image-injection middleware; `src/App.vue` wires the handler to `WebcamPanel`; `.gsloth.system.md` carries the system prompt.
+>
+> Verified end-to-end in browser: agent calls `capture_image`, receives the live webcam frame, and accurately describes the scene.
+>
+> History compaction for accumulated frames remains future work.
+
 ## Context
 
 The robot controller has a webcam feed and a chat to a vision-capable agent (`claude-sonnet-4-5` via gaunt-sloth). Goal: let the agent **iteratively perceive** — issue a movement, then *decide on its own* to call a `capture_image` tool, look at the result, and repeat. Auto-attaching every frame is wrong because (a) the agent shouldn't always pay vision tokens, and (b) iterative tasks need on-demand perception, not synchronous human attachments.

@@ -42,13 +42,31 @@ function captureFrame(): string | null {
 
   const video = videoRef.value
   const canvas = canvasRef.value
-  canvas.width = video.videoWidth
-  canvas.height = video.videoHeight
+  
+  // Downscale to max 640px on the longest side
+  const MAX_SIZE = 640;
+  let width = video.videoWidth;
+  let height = video.videoHeight;
+  
+  if (width > height) {
+    if (width > MAX_SIZE) {
+      height = Math.round(height * (MAX_SIZE / width));
+      width = MAX_SIZE;
+    }
+  } else {
+    if (height > MAX_SIZE) {
+      width = Math.round(width * (MAX_SIZE / height));
+      height = MAX_SIZE;
+    }
+  }
+
+  canvas.width = width
+  canvas.height = height
 
   const ctx = canvas.getContext('2d')
   if (!ctx) return null
 
-  ctx.drawImage(video, 0, 0)
+  ctx.drawImage(video, 0, 0, width, height)
   return canvas.toDataURL('image/jpeg', 0.8)
 }
 

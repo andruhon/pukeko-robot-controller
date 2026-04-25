@@ -2,7 +2,9 @@
   "extends": "@tsconfig/node22/tsconfig.json",
   "include": [
     "vite.config.*",
-    "vitest.config.*"
+    "vitest.config.*",
+    "server/**/*",
+    "robot-stub/**/*"
   ],
   "compilerOptions": {
     "noEmit": true,
