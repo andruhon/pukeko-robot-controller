@@ -27,7 +27,7 @@ const clientToolHandlers = {
     if (!frame) {
       return JSON.stringify({ error: 'Failed to capture frame. Is the camera active?' })
     }
-    
+
     // Extracted format from captureFrame(): "data:image/jpeg;base64,/9j/4..."
     const match = frame.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,([^"]*)$/)
     if (match) {
@@ -37,6 +37,18 @@ const clientToolHandlers = {
       })
     }
     return JSON.stringify({ error: 'Invalid frame format captured' })
+  }
+}
+
+const ROBOT_HOST = import.meta.env.VITE_ROBOT_HOST ?? '192.168.4.1'
+
+async function emergencyStop() {
+  // Best-effort, fire-and-forget. The robot's tiny HTTP server doesn't send
+  // CORS headers, so we use no-cors and ignore the (opaque) response.
+  try {
+    await fetch(`http://${ROBOT_HOST}/control?var=robot&val=8`, { mode: 'no-cors' })
+  } catch {
+    /* ignore */
   }
 }
 </script>
@@ -52,12 +64,21 @@ const clientToolHandlers = {
         <WebcamPanel ref="webcamPanelRef" />
       </section>
       <section class="panel chat-section">
-        <ChatInterface 
+        <ChatInterface
           :clientTools="clientTools"
           :clientToolHandlers="clientToolHandlers"
         />
       </section>
     </main>
+    <button
+      type="button"
+      class="emergency-stop"
+      aria-label="Emergency stop"
+      title="Emergency stop"
+      @click="emergencyStop"
+    >
+      STOP
+    </button>
   </div>
 </template>
 
@@ -107,5 +128,34 @@ const clientToolHandlers = {
   font-size: 0.9rem;
   font-weight: 600;
   border-bottom: 1px solid var(--border-color, #0f3460);
+}
+
+.emergency-stop {
+  position: fixed;
+  bottom: 1.5rem;
+  left: 1.5rem;
+  width: 6rem;
+  height: 6rem;
+  border-radius: 50%;
+  background: #d32f2f;
+  color: #fff;
+  font-size: 1.4rem;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  border: 4px solid #fff;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5), inset 0 -4px 0 rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  z-index: 9999;
+  font-family: inherit;
+}
+
+.emergency-stop:hover {
+  background: #e53935;
+}
+
+.emergency-stop:active {
+  background: #b71c1c;
+  transform: scale(0.96);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5), inset 0 -2px 0 rgba(0, 0, 0, 0.3);
 }
 </style>

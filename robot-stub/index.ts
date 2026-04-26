@@ -6,10 +6,14 @@ const { app, state } = createRobotStubApp()
 const server = app.listen(port, () => {
   console.log(`Robot stub server running on http://localhost:${port}`)
   console.log('Endpoints:')
-  console.log(`  GET /control?var=robot&val=N  - Robot commands (mimics Biped_Robot_Web.py)`)
-  console.log(`  GET /control?var=sensor&val=distance - Ultrasonic distance sensor`)
-  console.log(`  GET /status                   - View robot state (test only)`)
-  console.log(`  POST /reset                   - Reset robot state (test only)`)
+  console.log(`  GET /forward[?steps=N]       - Walk forward (default 1, max 10)`)
+  console.log(`  GET /backward[?steps=N]      - Walk backward`)
+  console.log(`  GET /turn_left[?steps=N]     - Rotate left in place`)
+  console.log(`  GET /turn_right[?steps=N]    - Rotate right in place`)
+  console.log(`  GET /stop                    - Freeze servos`)
+  console.log(`  GET /distance                - Ultrasonic reading in cm`)
+  console.log(`  GET /status                  - JSON heartbeat`)
+  console.log(`  POST /reset                  - Reset stub state (test only)`)
 })
 
 process.on('SIGTERM', () => {

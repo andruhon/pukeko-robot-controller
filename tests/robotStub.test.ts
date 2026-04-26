@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
-import { createRobotStubApp, createRobotState, ROBOT_COMMANDS, type RobotState } from '../robot-stub/robotStub.js'
+import {
+  createRobotStubApp,
+  createRobotState,
+  MAX_STEPS,
+  MOVEMENT_ENDPOINTS,
+  TRICK_ENDPOINTS,
+  type RobotState,
+} from '../robot-stub/robotStub.js'
 import type { Server } from 'node:http'
 
 let server: Server
@@ -27,170 +34,140 @@ afterAll(async () => {
   })
 })
 
-beforeEach(() => {
-  state.lastCommand = null
-  state.lastCommandName = null
-  state.commandHistory = []
-  state.simulatedDistance = 25.0
+beforeEach(async () => {
+  await fetch(`${baseUrl}/reset`, { method: 'POST' })
 })
 
-describe('Robot Stub - /control endpoint', () => {
-  it('should accept forward command (val=1) and return empty 200', async () => {
-    const res = await fetch(`${baseUrl}/control?var=robot&val=1`)
+describe('Movement endpoints', () => {
+  it('forward without steps defaults to 1 cycle', async () => {
+    const res = await fetch(`${baseUrl}/forward`)
     expect(res.status).toBe(200)
-
-    const body = await res.text()
-    expect(body).toBe('')
-
-    expect(state.lastCommand).toBe(1)
-    expect(state.lastCommandName).toBe('forward')
+    const body = await res.json()
+    expect(body).toEqual({ action: 'forward', steps: 1 })
+    expect(state.lastCommand).toBe('forward')
+    expect(state.lastSteps).toBe(1)
   })
 
-  it('should accept backward command (val=2)', async () => {
-    const res = await fetch(`${baseUrl}/control?var=robot&val=2`)
-    expect(res.status).toBe(200)
-    expect(state.lastCommand).toBe(2)
-    expect(state.lastCommandName).toBe('backward')
+  it('forward with explicit steps', async () => {
+    const res = await fetch(`${baseUrl}/forward?steps=4`)
+    const body = await res.json()
+    expect(body).toEqual({ action: 'forward', steps: 4 })
+    expect(state.lastSteps).toBe(4)
   })
 
-  it('should accept turn_left command (val=3)', async () => {
-    const res = await fetch(`${baseUrl}/control?var=robot&val=3`)
-    expect(res.status).toBe(200)
-    expect(state.lastCommand).toBe(3)
-    expect(state.lastCommandName).toBe('turn_left')
+  it('clamps steps above MAX_STEPS', async () => {
+    const res = await fetch(`${baseUrl}/forward?steps=999`)
+    const body = await res.json()
+    expect(body.steps).toBe(MAX_STEPS)
   })
 
-  it('should accept turn_right command (val=4)', async () => {
-    const res = await fetch(`${baseUrl}/control?var=robot&val=4`)
-    expect(res.status).toBe(200)
-    expect(state.lastCommand).toBe(4)
-    expect(state.lastCommandName).toBe('turn_right')
+  it('clamps steps below 1', async () => {
+    const res = await fetch(`${baseUrl}/forward?steps=0`)
+    const body = await res.json()
+    expect(body.steps).toBe(1)
   })
 
-  it('should accept stop command (val=8)', async () => {
-    const res = await fetch(`${baseUrl}/control?var=robot&val=8`)
-    expect(res.status).toBe(200)
-    expect(state.lastCommand).toBe(8)
-    expect(state.lastCommandName).toBe('stop')
+  it('treats non-integer steps as 1', async () => {
+    const res = await fetch(`${baseUrl}/forward?steps=abc`)
+    const body = await res.json()
+    expect(body.steps).toBe(1)
   })
 
-  it('should accept dance command (val=16)', async () => {
-    const res = await fetch(`${baseUrl}/control?var=robot&val=16`)
+  it.each(MOVEMENT_ENDPOINTS)('records last command for %s', async (path) => {
+    const res = await fetch(`${baseUrl}${path}?steps=2`)
     expect(res.status).toBe(200)
-    expect(state.lastCommand).toBe(16)
-    expect(state.lastCommandName).toBe('dance')
-  })
-
-  it('should record command history in order', async () => {
-    await fetch(`${baseUrl}/control?var=robot&val=1`)
-    await fetch(`${baseUrl}/control?var=robot&val=3`)
-    await fetch(`${baseUrl}/control?var=robot&val=1`)
-    await fetch(`${baseUrl}/control?var=robot&val=8`)
-
-    expect(state.commandHistory).toHaveLength(4)
-    expect(state.commandHistory[0].name).toBe('forward')
-    expect(state.commandHistory[1].name).toBe('turn_left')
-    expect(state.commandHistory[2].name).toBe('forward')
-    expect(state.commandHistory[3].name).toBe('stop')
-  })
-
-  it('should handle unknown command values gracefully', async () => {
-    const res = await fetch(`${baseUrl}/control?var=robot&val=99`)
-    expect(res.status).toBe(200)
-    expect(state.lastCommandName).toBe('unknown_99')
-  })
-
-  it('should return 200 with empty body when val is missing', async () => {
-    const res = await fetch(`${baseUrl}/control?var=robot`)
-    expect(res.status).toBe(200)
-    expect(await res.text()).toBe('')
-    expect(state.lastCommand).toBeNull()
-  })
-
-  it('should return 200 for non-integer val (mimics real robot pre-crash)', async () => {
-    const res = await fetch(`${baseUrl}/control?var=robot&val=abc`)
-    expect(res.status).toBe(200)
-    expect(await res.text()).toBe('')
+    expect(state.lastCommand).toBe(path.slice(1))
+    expect(state.lastSteps).toBe(2)
   })
 })
 
-describe('Robot Stub - sensor endpoint', () => {
-  it('should return distance reading for ultrasonic sensor', async () => {
-    const res = await fetch(`${baseUrl}/control?var=sensor&val=distance`)
+describe('Stop endpoint', () => {
+  it('records stop with 0 steps', async () => {
+    const res = await fetch(`${baseUrl}/stop`)
     expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ action: 'stop' })
+    expect(state.lastCommand).toBe('stop')
+    expect(state.lastSteps).toBe(0)
+  })
+})
 
+describe('Distance endpoint', () => {
+  it('returns numeric string with one decimal', async () => {
+    const res = await fetch(`${baseUrl}/distance`)
+    expect(res.status).toBe(200)
     const body = await res.text()
+    expect(body).toMatch(/^\d+\.\d$/)
     const distance = parseFloat(body)
-    expect(distance).toBeGreaterThan(0)
-    // Default simulated distance is 25.0 +/- 1.0 noise
     expect(distance).toBeGreaterThan(20)
     expect(distance).toBeLessThan(30)
   })
 
-  it('should return distance as a numeric string with one decimal', async () => {
-    const res = await fetch(`${baseUrl}/control?var=sensor&val=distance`)
-    const body = await res.text()
-    expect(body).toMatch(/^\d+\.\d$/)
+  it('updates lastDistanceCm in status', async () => {
+    await fetch(`${baseUrl}/distance`)
+    expect(state.lastDistanceCm).not.toBeNull()
   })
 })
 
-describe('Robot Stub - /status endpoint', () => {
-  it('should return current robot state', async () => {
-    await fetch(`${baseUrl}/control?var=robot&val=1`)
-
+describe('Status endpoint', () => {
+  it('returns full heartbeat shape', async () => {
+    await fetch(`${baseUrl}/forward?steps=3`)
     const res = await fetch(`${baseUrl}/status`)
-    expect(res.status).toBe(200)
-
     const data = await res.json()
-    expect(data.lastCommand).toBe(1)
-    expect(data.lastCommandName).toBe('forward')
-    expect(data.commandCount).toBe(1)
-    expect(data.history).toHaveLength(1)
+    expect(data.lastCommand).toBe('forward')
+    expect(data.lastSteps).toBe(3)
+    expect(typeof data.uptimeMs).toBe('number')
+    expect(typeof data.lastCommandAtMs).toBe('number')
+  })
+
+  it('returns null fields before any commands', async () => {
+    const res = await fetch(`${baseUrl}/status`)
+    const data = await res.json()
+    expect(data.lastCommand).toBeNull()
+    expect(data.lastSteps).toBeNull()
+    expect(data.lastCommandAtMs).toBeNull()
+    expect(data.lastDistanceCm).toBeNull()
   })
 })
 
-describe('Robot Stub - /reset endpoint', () => {
-  it('should reset robot state', async () => {
-    await fetch(`${baseUrl}/control?var=robot&val=1`)
-    expect(state.lastCommand).toBe(1)
-
-    const res = await fetch(`${baseUrl}/reset`, { method: 'POST' })
+describe('Trick endpoints', () => {
+  it.each(TRICK_ENDPOINTS)('records single-cycle trick %s', async (path) => {
+    const res = await fetch(`${baseUrl}${path}`)
     expect(res.status).toBe(200)
-
-    const data = await res.json()
-    expect(data.reset).toBe(true)
-    expect(state.lastCommand).toBeNull()
-    expect(state.commandHistory).toHaveLength(0)
+    expect(await res.json()).toEqual({ action: path.slice(1) })
+    expect(state.lastCommand).toBe(path.slice(1))
+    expect(state.lastSteps).toBe(1)
   })
 })
 
-describe('ROBOT_COMMANDS mapping', () => {
-  it('should contain all documented command values', () => {
-    expect(ROBOT_COMMANDS[1]).toBe('forward')
-    expect(ROBOT_COMMANDS[2]).toBe('backward')
-    expect(ROBOT_COMMANDS[3]).toBe('turn_left')
-    expect(ROBOT_COMMANDS[4]).toBe('turn_right')
-    expect(ROBOT_COMMANDS[8]).toBe('stop')
-    expect(ROBOT_COMMANDS[10]).toBe('sprint')
-    expect(ROBOT_COMMANDS[11]).toBe('left_kick')
-    expect(ROBOT_COMMANDS[12]).toBe('right_kick')
-    expect(ROBOT_COMMANDS[13]).toBe('left_tilt')
-    expect(ROBOT_COMMANDS[14]).toBe('right_tilt')
-    expect(ROBOT_COMMANDS[15]).toBe('left_stamp')
-    expect(ROBOT_COMMANDS[16]).toBe('dance')
-    expect(ROBOT_COMMANDS[17]).toBe('avoid')
-    expect(ROBOT_COMMANDS[18]).toBe('follow')
-    expect(ROBOT_COMMANDS[19]).toBe('left_ankles')
-    expect(ROBOT_COMMANDS[20]).toBe('right_stamp')
-    expect(ROBOT_COMMANDS[21]).toBe('right_ankles')
+describe('Command history', () => {
+  it('records commands in order', async () => {
+    await fetch(`${baseUrl}/forward`)
+    await fetch(`${baseUrl}/turn_left?steps=8`)
+    await fetch(`${baseUrl}/forward?steps=2`)
+    await fetch(`${baseUrl}/stop`)
+
+    expect(state.commandHistory).toHaveLength(4)
+    expect(state.commandHistory[0].name).toBe('forward')
+    expect(state.commandHistory[1]).toMatchObject({ name: 'turn_left', steps: 8 })
+    expect(state.commandHistory[2]).toMatchObject({ name: 'forward', steps: 2 })
+    expect(state.commandHistory[3].name).toBe('stop')
+  })
+})
+
+describe('Unknown endpoints', () => {
+  it('returns 404', async () => {
+    const res = await fetch(`${baseUrl}/control?var=robot&val=1`)
+    expect(res.status).toBe(404)
   })
 })
 
 describe('createRobotState', () => {
-  it('should create clean initial state', () => {
+  it('creates clean initial state', () => {
     const fresh = createRobotState()
     expect(fresh.lastCommand).toBeNull()
-    expect(fresh.lastCommandName).toBeNull()
+    expect(fresh.lastSteps).toBeNull()
+    expect(fresh.lastCommandAtMs).toBeNull()
+    expect(fresh.lastDistanceCm).toBeNull()
     expect(fresh.commandHistory).toHaveLength(0)
     expect(fresh.simulatedDistance).toBe(25.0)
   })
