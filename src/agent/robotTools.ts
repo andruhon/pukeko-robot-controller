@@ -31,7 +31,7 @@ const stepsSchema = z.object({
     .max(10)
     .optional()
     .describe(
-      'Number of cycles to run. Defaults to 1; capped at 10 by the firmware. Calibration: 1 forward/backward cycle ≈ 1.5 cm; 8 turn cycles ≈ 90°.'
+      'Number of cycles to run. Defaults to 1; capped at 10 by the firmware. Calibration: 1 forward/backward cycle ≈ 1.5 cm; 6 turn cycles ≈ 90° (~15° per turn cycle).'
     ),
 });
 
@@ -59,12 +59,12 @@ export function createRobotTools(host: string): StructuredToolInterface[] {
     movement(
       'turn_left',
       '/turn_left',
-      'Rotate the robot left in place. Optional `steps` (1-10). ~11° per cycle; 8 ≈ 90°.'
+      'Rotate the robot left in place. Optional `steps` (1-10). ~15° per cycle; 6 ≈ 90°.'
     ),
     movement(
       'turn_right',
       '/turn_right',
-      'Rotate the robot right in place. Optional `steps` (1-10). ~11° per cycle; 8 ≈ 90°.'
+      'Rotate the robot right in place. Optional `steps` (1-10). ~15° per cycle; 6 ≈ 90°.'
     ),
     tool(async () => callRobot(host, '/stop'), {
       name: 'stop',
@@ -74,7 +74,7 @@ export function createRobotTools(host: string): StructuredToolInterface[] {
     tool(async () => callRobot(host, '/distance'), {
       name: 'read_distance',
       description:
-        'Read the ultrasonic distance sensor. Returns distance to the nearest obstacle in centimetres ("-1.0" on read failure).',
+        'Read the ultrasonic distance sensor. Returns distance to the nearest obstacle in centimetres ("-1.0" on read failure). Trust this reading: when it disagrees with what the camera shows you (e.g. visually facing a box but reading ~70 cm), the robot is almost certainly mis-aimed — the cone is shooting past the target. Use as an alignment check after every small heading adjustment, not just once at the start of an approach.',
       schema: z.object({}),
     }) as StructuredToolInterface,
     tool(async () => callRobot(host, '/status'), {
