@@ -17,7 +17,7 @@ export function createLlm(): LlmSelection {
       provider,
       llm: new ChatOllama({
         baseUrl: process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434',
-        model: process.env.OLLAMA_MODEL ?? 'qwen3-vl:8b',
+        model: process.env.OLLAMA_MODEL ?? 'gemma4:31b',
       }),
     };
   }

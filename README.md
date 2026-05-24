@@ -23,7 +23,7 @@ The backend picks its model from environment variables when `npm run server` sta
 |---|---|---|
 | `LLM_PROVIDER` | `ollama` | `ollama` or `anthropic` |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Used when provider is `ollama` |
-| `OLLAMA_MODEL` | `qwen3-vl:8b` | Used when provider is `ollama`. Must support tool calling and ideally vision. |
+| `OLLAMA_MODEL` | `gemma4:31b` | Used when provider is `ollama`. Must support tool calling and ideally vision. |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Used when provider is `anthropic` |
 | `ROBOT_HOST` | `192.168.4.1` | Robot HTTP API host |
 
