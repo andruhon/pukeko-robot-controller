@@ -35,6 +35,68 @@ function stopCamera() {
   isActive.value = false
 }
 
+function loadImage(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error('Failed to load image data URL'))
+    img.src = dataUrl
+  })
+}
+
+async function composeBeforeAfter(
+  beforeDataUrl: string,
+  afterDataUrl: string
+): Promise<string | null> {
+  if (!canvasRef.value) return null
+  const [before, after] = await Promise.all([
+    loadImage(beforeDataUrl),
+    loadImage(afterDataUrl),
+  ])
+
+  // Normalize heights so the two frames sit on a shared baseline.
+  const targetH = Math.max(before.height, after.height)
+  const scale = (img: HTMLImageElement) => targetH / img.height
+  const wB = Math.round(before.width * scale(before))
+  const wA = Math.round(after.width * scale(after))
+
+  const LABEL_H = 28
+  const GAP = 12
+  const PAD = 8
+  const totalW = PAD + wB + GAP + wA + PAD
+  const totalH = LABEL_H + targetH + PAD
+
+  const canvas = canvasRef.value
+  canvas.width = totalW
+  canvas.height = totalH
+
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+
+  // Background — dark, so the panel sits nicely whether the model renders on
+  // light or dark chat bg.
+  ctx.fillStyle = '#16213e'
+  ctx.fillRect(0, 0, totalW, totalH)
+
+  // Labels.
+  ctx.fillStyle = '#ffffff'
+  ctx.font = 'bold 18px sans-serif'
+  ctx.textBaseline = 'top'
+  ctx.textAlign = 'center'
+  ctx.fillText('Before', PAD + wB / 2, 6)
+  ctx.fillText('After', PAD + wB + GAP + wA / 2, 6)
+
+  // Frames.
+  ctx.drawImage(before, PAD, LABEL_H, wB, targetH)
+  ctx.drawImage(after, PAD + wB + GAP, LABEL_H, wA, targetH)
+
+  // Divider.
+  ctx.fillStyle = '#ff9800'
+  ctx.fillRect(PAD + wB + GAP / 2 - 1, LABEL_H, 2, targetH)
+
+  return canvas.toDataURL('image/jpeg', 0.8)
+}
+
 function captureFrame(): string | null {
   if (!videoRef.value || !canvasRef.value || !isActive.value) {
     return null
@@ -80,6 +142,7 @@ onUnmounted(() => {
 
 defineExpose({
   captureFrame,
+  composeBeforeAfter,
   startCamera,
   stopCamera,
   isActive,

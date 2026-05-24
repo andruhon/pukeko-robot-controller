@@ -6,17 +6,160 @@ import WebcamPanel from './components/WebcamPanel.vue'
 
 const webcamPanelRef = ref<InstanceType<typeof WebcamPanel> | null>(null)
 
+const ROBOT_HOST = import.meta.env.VITE_ROBOT_HOST ?? '192.168.4.1'
+
+function robotUrl(path: string): string {
+  return `http://${ROBOT_HOST}${path}`
+}
+
+const stepsParameter = {
+  type: 'object' as const,
+  properties: {
+    steps: {
+      type: 'integer' as const,
+      minimum: 1,
+      maximum: 10,
+      description:
+        'Number of cycles to run (1-10, defaults to 1). 1 forward/backward cycle ≈ 1.5 cm; 1 turn cycle ≈ 15°; 6 turn cycles ≈ 90°.',
+    },
+  },
+  required: [],
+}
+
+const motionDescriptions = {
+  move_forward:
+    'Walk the robot forward. Optional `steps` (1-10). ~1.5 cm per cycle. Automatically captures Before/After camera frames and ultrasonic readings on every call.',
+  move_backward:
+    'Walk the robot backward. Optional `steps` (1-10). ~1.5 cm per cycle. Automatically captures Before/After camera frames and ultrasonic readings on every call.',
+  turn_left:
+    'Rotate the robot left in place. Optional `steps` (1-10). ~15° per cycle; 6 ≈ 90°. Automatically captures Before/After camera frames and ultrasonic readings on every call.',
+  turn_right:
+    'Rotate the robot right in place. Optional `steps` (1-10). ~15° per cycle; 6 ≈ 90°. Automatically captures Before/After camera frames and ultrasonic readings on every call.',
+} as const
+
 const clientTools: Tool[] = [
   {
     name: 'capture_image',
-    description: 'Capture a photo from the robot webcam. Returns the current image of the robot and its surroundings as seen from above.',
+    description:
+      'Capture a photo from the robot webcam. Returns the current image of the robot and its surroundings as seen from above.',
     parameters: {
       type: 'object',
       properties: {},
       required: [],
     },
   },
+  {
+    name: 'move_forward',
+    description: motionDescriptions.move_forward,
+    parameters: stepsParameter,
+  },
+  {
+    name: 'move_backward',
+    description: motionDescriptions.move_backward,
+    parameters: stepsParameter,
+  },
+  {
+    name: 'turn_left',
+    description: motionDescriptions.turn_left,
+    parameters: stepsParameter,
+  },
+  {
+    name: 'turn_right',
+    description: motionDescriptions.turn_right,
+    parameters: stepsParameter,
+  },
 ]
+
+async function readDistance(): Promise<string | null> {
+  try {
+    const res = await fetch(robotUrl('/distance'))
+    if (!res.ok) return null
+    const text = (await res.text()).trim()
+    return text || null
+  } catch {
+    return null
+  }
+}
+
+function frameToEnvelope(frame: string | null): { mimeType: string; data: string } | null {
+  if (!frame) return null
+  const match = frame.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,([^"]*)$/)
+  if (!match) return null
+  return { mimeType: match[1], data: match[2] }
+}
+
+function coerceSteps(args: unknown): number {
+  if (args && typeof args === 'object' && 'steps' in args) {
+    const raw = (args as { steps?: unknown }).steps
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 1) {
+      return Math.min(10, Math.floor(raw))
+    }
+  }
+  return 1
+}
+
+async function runMotion(
+  toolName: keyof typeof motionDescriptions,
+  endpoint: string,
+  args: unknown
+): Promise<string> {
+  if (!webcamPanelRef.value) {
+    return JSON.stringify({ error: 'Webcam not initialized' })
+  }
+  const steps = coerceSteps(args)
+  const motionLabel = steps === 1 ? toolName : `${toolName} (steps=${steps})`
+
+  const distanceBefore = await readDistance()
+  const beforeFrame = webcamPanelRef.value.captureFrame()
+  if (!beforeFrame) {
+    return JSON.stringify({ error: 'Failed to capture Before frame. Is the camera active?', motion: motionLabel })
+  }
+
+  const query = steps > 1 ? `?steps=${steps}` : ''
+  try {
+    const res = await fetch(robotUrl(`${endpoint}${query}`))
+    if (!res.ok) {
+      return JSON.stringify({
+        error: `Robot returned HTTP ${res.status} for ${endpoint}`,
+        motion: motionLabel,
+      })
+    }
+    // Consume body so the connection closes cleanly; we don't need the content.
+    await res.text()
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'unknown error'
+    return JSON.stringify({
+      error: `Failed to reach robot at ${ROBOT_HOST}: ${message}`,
+      motion: motionLabel,
+    })
+  }
+
+  const distanceAfter = await readDistance()
+  const afterFrame = webcamPanelRef.value.captureFrame()
+  if (!afterFrame) {
+    return JSON.stringify({ error: 'Failed to capture After frame.', motion: motionLabel })
+  }
+
+  let compositeUrl: string | null
+  try {
+    compositeUrl = await webcamPanelRef.value.composeBeforeAfter(beforeFrame, afterFrame)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'compose error'
+    return JSON.stringify({ error: `Failed to compose Before/After image: ${message}`, motion: motionLabel })
+  }
+
+  const envelope = frameToEnvelope(compositeUrl)
+  if (!envelope) {
+    return JSON.stringify({ error: 'Invalid composite frame format', motion: motionLabel })
+  }
+
+  return JSON.stringify({
+    ...envelope,
+    motion: motionLabel,
+    distanceBefore: distanceBefore ?? undefined,
+    distanceAfter: distanceAfter ?? undefined,
+  })
+}
 
 const clientToolHandlers = {
   capture_image: async () => {
@@ -24,29 +167,22 @@ const clientToolHandlers = {
       return JSON.stringify({ error: 'Webcam not initialized' })
     }
     const frame = webcamPanelRef.value.captureFrame()
-    if (!frame) {
-      return JSON.stringify({ error: 'Failed to capture frame. Is the camera active?' })
-    }
-
-    // Extracted format from captureFrame(): "data:image/jpeg;base64,/9j/4..."
-    const match = frame.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,([^"]*)$/)
-    if (match) {
-      return JSON.stringify({
-        mimeType: match[1],
-        data: match[2]
-      })
-    }
-    return JSON.stringify({ error: 'Invalid frame format captured' })
-  }
+    const envelope = frameToEnvelope(frame)
+    if (envelope) return JSON.stringify(envelope)
+    return JSON.stringify({ error: 'Failed to capture frame. Is the camera active?' })
+  },
+  move_forward: (args: unknown) => runMotion('move_forward', '/forward', args),
+  move_backward: (args: unknown) => runMotion('move_backward', '/backward', args),
+  turn_left: (args: unknown) => runMotion('turn_left', '/turn_left', args),
+  turn_right: (args: unknown) => runMotion('turn_right', '/turn_right', args),
 }
 
-const ROBOT_HOST = import.meta.env.VITE_ROBOT_HOST ?? '192.168.4.1'
-
 async function emergencyStop() {
-  // Best-effort, fire-and-forget. The robot's tiny HTTP server doesn't send
-  // CORS headers, so we use no-cors and ignore the (opaque) response.
+  // Best-effort, fire-and-forget. The robot is on the same network and now
+  // sends CORS headers, but for an emergency stop we don't care about the
+  // response either way.
   try {
-    await fetch(`http://${ROBOT_HOST}/control?var=robot&val=8`, { mode: 'no-cors' })
+    await fetch(robotUrl('/stop'))
   } catch {
     /* ignore */
   }

@@ -1,12 +1,20 @@
 import { createMiddleware } from 'langchain';
 import { ToolMessage, HumanMessage } from '@langchain/core/messages';
 import type { MessageContent } from '@langchain/core/messages';
+import { MOTION_TOOL_NAMES } from './robotTools.js';
 
 interface ImagePayload {
   mimeType?: string;
   data?: string;
   error?: string;
+  // Motion tools include sensor readings around the move.
+  distanceBefore?: string;
+  distanceAfter?: string;
+  // Optional human-facing motion label, e.g. "move_forward (steps=2)".
+  motion?: string;
 }
+
+const MOTION_NAMES: ReadonlySet<string> = new Set(MOTION_TOOL_NAMES);
 
 export interface ImageInjectionOptions {
   // ChatOllama only accepts {type:'image_url', image_url: <data-URL>} blocks;
@@ -15,23 +23,43 @@ export interface ImageInjectionOptions {
   provider: 'ollama' | 'anthropic';
 }
 
+function formatDistanceDelta(before?: string, after?: string): string | null {
+  if (!before && !after) return null;
+  const b = before ? `${before} cm` : 'unknown';
+  const a = after ? `${after} cm` : 'unknown';
+  const nb = before ? Number.parseFloat(before) : Number.NaN;
+  const na = after ? Number.parseFloat(after) : Number.NaN;
+  let delta = '';
+  if (Number.isFinite(nb) && Number.isFinite(na)) {
+    const d = na - nb;
+    const sign = d >= 0 ? '+' : '';
+    delta = ` (Δ ${sign}${d.toFixed(1)} cm)`;
+  }
+  return `Distance: ${b} → ${a}${delta}`;
+}
+
 export function createFrontendImageInjectionMiddleware(opts: ImageInjectionOptions) {
   return createMiddleware({
     name: 'frontend-image-injection',
 
     beforeModel: async (state) => {
       const messages = state.messages || [];
-      const injected: ImagePayload[] = [];
+      // Each entry pairs the parsed envelope with the originating tool name so
+      // we can prepend a motion label when relevant.
+      const injected: Array<{ payload: ImagePayload; toolName: string }> = [];
 
       for (let i = messages.length - 1; i >= Math.max(0, messages.length - 5); i--) {
         const msg = messages[i];
         if (
           msg instanceof ToolMessage &&
-          msg.name === 'capture_image' &&
-          typeof msg.content === 'string'
+          typeof msg.content === 'string' &&
+          (msg.name === 'capture_image' || (msg.name && MOTION_NAMES.has(msg.name)))
         ) {
           try {
-            injected.push(JSON.parse(msg.content) as ImagePayload);
+            injected.push({
+              payload: JSON.parse(msg.content) as ImagePayload,
+              toolName: msg.name,
+            });
           } catch {
             // Non-JSON tool result — skip injection.
           }
@@ -41,9 +69,10 @@ export function createFrontendImageInjectionMiddleware(opts: ImageInjectionOptio
       if (injected.length === 0) return undefined;
 
       const newMessages = [...messages];
-      for (const payload of injected) {
+      for (const { payload, toolName } of injected) {
         if (payload.error) {
-          newMessages.push(new HumanMessage({ content: `Camera unavailable: ${payload.error}` }));
+          const label = MOTION_NAMES.has(toolName) ? `Motion (${toolName}) failed` : 'Camera unavailable';
+          newMessages.push(new HumanMessage({ content: `${label}: ${payload.error}` }));
           continue;
         }
         if (payload.mimeType && payload.data) {
@@ -60,10 +89,16 @@ export function createFrontendImageInjectionMiddleware(opts: ImageInjectionOptio
                   data: payload.data,
                 };
 
+          const isMotion = MOTION_NAMES.has(toolName);
+          const distanceLine = formatDistanceDelta(payload.distanceBefore, payload.distanceAfter);
+          const headerText = isMotion
+            ? `Before/After frames for ${payload.motion ?? toolName}.${distanceLine ? ` ${distanceLine}.` : ''}`
+            : 'Camera frame captured:';
+
           newMessages.push(
             new HumanMessage({
               content: [
-                { type: 'text', text: 'Camera frame captured:' },
+                { type: 'text', text: headerText },
                 block,
               ] as MessageContent,
             })

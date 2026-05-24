@@ -35,36 +35,47 @@ const stepsSchema = z.object({
     ),
 });
 
+export const MOTION_TOOL_NAMES = [
+  'move_forward',
+  'move_backward',
+  'turn_left',
+  'turn_right',
+] as const;
+
+export type MotionToolName = (typeof MOTION_TOOL_NAMES)[number];
+
 export function createRobotTools(host: string): StructuredToolInterface[] {
-  const movement = (name: string, path: string, description: string) =>
-    tool(
-      async (args: { steps?: number }) => {
-        const query = args.steps && args.steps > 1 ? `steps=${args.steps}` : undefined;
-        return callRobot(host, path, query);
-      },
-      { name, description, schema: stepsSchema }
-    ) as StructuredToolInterface;
+  // Motion tools are CLIENT-fulfilled: the browser handler reads /distance,
+  // captures a Before frame, sends the motion to the robot, captures an After
+  // frame, composes them into one image, and returns the envelope. The server
+  // body is just a stub — AG-UI routes the call to the browser before it ever
+  // reaches the function below.
+  const clientMotion = (name: MotionToolName, description: string) => {
+    const t = tool(async () => 'Client tool stub executed on server', {
+      name,
+      description,
+      schema: stepsSchema,
+    }) as StructuredToolInterface;
+    (t as unknown as { metadata: Record<string, unknown> }).metadata = { client: true };
+    return t;
+  };
 
   return [
-    movement(
+    clientMotion(
       'move_forward',
-      '/forward',
-      'Walk the robot forward. Optional `steps` (1-10) for multiple cycles. ~1.5 cm per cycle.'
+      'Walk the robot forward. Optional `steps` (1-10) for multiple cycles. ~1.5 cm per cycle. Automatically captures Before/After camera frames and ultrasonic readings on every call — you do not need to call capture_image or read_distance around it.'
     ),
-    movement(
+    clientMotion(
       'move_backward',
-      '/backward',
-      'Walk the robot backward. Optional `steps` (1-10). ~1.5 cm per cycle.'
+      'Walk the robot backward. Optional `steps` (1-10). ~1.5 cm per cycle. Automatically captures Before/After camera frames and ultrasonic readings on every call.'
     ),
-    movement(
+    clientMotion(
       'turn_left',
-      '/turn_left',
-      'Rotate the robot left in place. Optional `steps` (1-10). ~15° per cycle; 6 ≈ 90°.'
+      'Rotate the robot left in place. Optional `steps` (1-10). ~15° per cycle; 6 ≈ 90°. Automatically captures Before/After camera frames and ultrasonic readings on every call.'
     ),
-    movement(
+    clientMotion(
       'turn_right',
-      '/turn_right',
-      'Rotate the robot right in place. Optional `steps` (1-10). ~15° per cycle; 6 ≈ 90°.'
+      'Rotate the robot right in place. Optional `steps` (1-10). ~15° per cycle; 6 ≈ 90°. Automatically captures Before/After camera frames and ultrasonic readings on every call.'
     ),
     tool(async () => callRobot(host, '/stop'), {
       name: 'stop',

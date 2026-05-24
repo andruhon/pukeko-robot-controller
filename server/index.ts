@@ -2,6 +2,7 @@ import { startAgUiServer } from '@gaunt-sloth/api';
 import { DEFAULT_CONFIG, type GthConfig } from '@gaunt-sloth/core/config.js';
 import { captureImageTool } from '../src/agent/captureImageTool.js';
 import { createFrontendImageInjectionMiddleware } from '../src/agent/frontendImageInjectionMiddleware.js';
+import { createMotionSummarizationMiddleware } from '../src/agent/motionSummarizationMiddleware.js';
 import { createRobotTools } from '../src/agent/robotTools.js';
 import { createLlm } from './createLlm.js';
 
@@ -16,7 +17,10 @@ const config = {
   llm,
   noDefaultPrompts: true,
   tools: [captureImageTool, ...createRobotTools(ROBOT_HOST)],
-  middleware: [createFrontendImageInjectionMiddleware({ provider })],
+  middleware: [
+    createFrontendImageInjectionMiddleware({ provider }),
+    createMotionSummarizationMiddleware({ llm }),
+  ],
   commands: {
     ...DEFAULT_CONFIG.commands,
     api: {

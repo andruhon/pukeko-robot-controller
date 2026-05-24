@@ -66,6 +66,19 @@ export function createRobotStubApp(state?: RobotState): { app: Express; state: R
   const robotState = state ?? createRobotState()
   const app = express()
 
+  // CORS so the browser-side motion tool handler can call /distance, /forward,
+  // etc. directly. The real robot firmware (Biped_Robot_Web.py) does the same.
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    if (req.method === 'OPTIONS') {
+      res.status(204).end()
+      return
+    }
+    next()
+  })
+
   app.get('/', (_req, res) => {
     res.type('text/plain').send('Acebott biped robot - agent API.\n')
   })

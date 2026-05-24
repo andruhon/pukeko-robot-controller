@@ -139,17 +139,49 @@ and web client (WebcamPanel component, useRobotChat composable).
 └── vitest.config.ts        Test runner config
 ```
 
-## Robot HTTP API
+## Motion tools
 
-The robot (or stub) accepts commands at `GET /control?var=robot&val=N`:
+The four motion tools — `move_forward`, `move_backward`, `turn_left`, `turn_right` — are
+**client-fulfilled** and auto-instrument every call. When the agent invokes one, the browser
+handler runs the following sequence and returns a single tool result:
 
-| val | Action |
-|---|---|
-| 1 | Forward (single step) |
-| 2 | Backward (single step) |
-| 3 | Turn left |
-| 4 | Turn right |
-| 8 | Stop |
+1. `read_distance` → ultrasonic reading **before**
+2. capture **Before** frame from the webcam
+3. send the motion request to the robot (`GET /forward?steps=N`, etc.)
+4. `read_distance` → ultrasonic reading **after**
+5. capture **After** frame from the webcam
+6. compose the two frames into one image via `<canvas>` — labels "Before" / "After", a divider in the middle, both halves aligned to a shared baseline
+7. return `{ mimeType, data, motion, distanceBefore, distanceAfter }` as the tool result
 
-The response is always an empty HTTP 200. The stub also supports
-`GET /control?var=sensor&val=distance` for ultrasonic distance readings.
+The agent therefore sees a single composite image plus the sensor delta on every move, with no
+need to call `capture_image` or `read_distance` around motions explicitly. `capture_image`,
+`read_distance`, `read_status`, and `stop` remain available for mid-sequence checks and
+emergencies.
+
+### Concurrent history summarization
+
+While the browser is doing the capture+move+capture+compose round-trip, the server fires a
+summarization LLM call in parallel (see `src/agent/motionSummarizationMiddleware.ts`). The
+summary keeps the user's original prompt verbatim, drops every prior image content block, and
+condenses what the agent has been doing. Before the next model turn, the middleware splices the
+summary into the message history in place of the older scratch turns — keeping the context tight
+for small local models.
+
+### Robot HTTP API
+
+The robot (firmware `acebot-biped/for-agents/Biped_Robot_Web.py`) and the stub both expose:
+
+| Path | Method | Description |
+|---|---|---|
+| `/forward?steps=N` | GET | Walk N forward cycles (default 1, max 10). Blocks until done. |
+| `/backward?steps=N` | GET | As above, reversed. |
+| `/turn_left?steps=N` | GET | Rotate left in place. |
+| `/turn_right?steps=N` | GET | Rotate right in place. |
+| `/stop` | GET | Halt servos. |
+| `/distance` | GET | Plain-text ultrasonic reading in cm (`-1.0` on failure). |
+| `/status` | GET | JSON heartbeat. |
+| `OPTIONS *` | OPTIONS | CORS preflight (204). |
+
+All responses send `Access-Control-Allow-Origin: *` so the browser-side motion-tool handlers
+can fetch the robot directly. If you fork the firmware, keep the CORS headers — the UI depends
+on them.
