@@ -9,6 +9,9 @@ export default defineConfig({
     'gemma-default': {
       llm: { provider: 'ollama', model: 'gemma4:31b' },
       middleware: ['frontend-images', 'motion-summary'],
+      // Both prompt files default to the repo root and may be overridden per profile:
+      // systemPromptPath: 'system-prompt.md',          // behavioural prompt (gaunt-sloth projectGuidelines)
+      // summaryPromptPath: 'summarization-prompt.md',   // motion-summarization prompt
     },
 
     'gemma-debug': {

@@ -76,17 +76,6 @@ const clientTools: Tool[] = [
   },
 ]
 
-async function readDistance(): Promise<string | null> {
-  try {
-    const res = await fetch(robotUrl('/distance'))
-    if (!res.ok) return null
-    const text = (await res.text()).trim()
-    return text || null
-  } catch {
-    return null
-  }
-}
-
 function frameToEnvelope(frame: string | null): { mimeType: string; data: string } | null {
   if (!frame) return null
   const match = frame.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,([^"]*)$/)
@@ -115,7 +104,6 @@ async function runMotion(
   const steps = coerceSteps(args)
   const motionLabel = steps === 1 ? toolName : `${toolName} (steps=${steps})`
 
-  const distanceBefore = await readDistance()
   const beforeFrame = webcamPanelRef.value.captureFrame()
   if (!beforeFrame) {
     return JSON.stringify({ error: 'Failed to capture Before frame. Is the camera active?', motion: motionLabel })
@@ -139,7 +127,6 @@ async function runMotion(
     })
   }
 
-  const distanceAfter = await readDistance()
   const afterFrame = webcamPanelRef.value.captureFrame()
   if (!afterFrame) {
     return JSON.stringify({ error: 'Failed to capture After frame.', motion: motionLabel })
@@ -161,8 +148,6 @@ async function runMotion(
   return JSON.stringify({
     ...envelope,
     motion: motionLabel,
-    distanceBefore: distanceBefore ?? undefined,
-    distanceAfter: distanceAfter ?? undefined,
   })
 }
 
@@ -182,12 +167,12 @@ const clientToolHandlers = {
   turn_right: (args: unknown) => runMotion('turn_right', '/turn_right', args),
 }
 
-async function emergencyStop() {
-  try {
-    await fetch(robotUrl('/stop'))
-  } catch {
-    /* ignore */
-  }
+function emergencyStop() {
+  // Halt the agent itself — the real runaway risk. This aborts any in-flight
+  // model stream and blocks the tool loop from resuming, so no further motion
+  // commands are issued. (The robot firmware can't interrupt a motion mid-cycle
+  // anyway, so poking it is pointless; stopping the agent is what matters.)
+  chatInterfaceRef.value?.stop()
 }
 
 function startNewConversation() {
@@ -272,5 +257,9 @@ function startNewConversation() {
   font-size: 0.9rem;
   font-weight: 600;
   border-bottom: var(--line-separator-subtle);
+}
+
+.stop {
+  background: salmon;
 }
 </style>

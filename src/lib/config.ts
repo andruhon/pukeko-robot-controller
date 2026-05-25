@@ -35,7 +35,14 @@ export interface RobotOptions {
 
 export interface PukekoProfile {
   llm: LlmSpec;
+  // Path to the agent's behavioural system prompt, resolved from the project
+  // root. Wired into gaunt-sloth's `projectGuidelines` slot. Defaults to
+  // `system-prompt.md`.
   systemPromptPath?: string;
+  // Path to the motion-summarization prompt, resolved from the project root.
+  // Defaults to `summarization-prompt.md`; the middleware keeps an identical
+  // baked-in copy as a fallback if the file is missing.
+  summaryPromptPath?: string;
   middleware?: MiddlewareEntry[];
   observability?: ObservabilityOptions;
   robot?: RobotOptions;

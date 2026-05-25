@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { startAgUiServer } from '@gaunt-sloth/api';
 import { DEFAULT_CONFIG, type GthConfig } from '@gaunt-sloth/core/config.js';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
@@ -12,6 +14,16 @@ import { createLlm } from './createLlm.js';
 
 const PORT = 3000;
 const DEFAULT_ROBOT_HOST = '192.168.4.1';
+const DEFAULT_SYSTEM_PROMPT_FILE = 'system-prompt.md';
+const DEFAULT_SUMMARY_PROMPT_FILE = 'summarization-prompt.md';
+
+// Read a prompt file relative to the project root. Returns undefined when the
+// file is absent so callers can fall back to a baked-in default.
+function readPromptFileOrUndefined(relPath: string): string | undefined {
+  const abs = resolve(process.cwd(), relPath);
+  if (!existsSync(abs)) return undefined;
+  return readFileSync(abs, 'utf8');
+}
 
 const { configPath, profileName, profile } = await loadConfig();
 console.log(
@@ -35,10 +47,14 @@ function buildMiddleware(entries: MiddlewareEntry[] | undefined, llm: BaseChatMo
           built.push(createFrontendImageInjectionMiddleware({ provider }));
           enabled.push(entry);
           break;
-        case 'motion-summary':
-          built.push(createMotionSummarizationMiddleware({ llm }));
+        case 'motion-summary': {
+          const summaryPrompt = readPromptFileOrUndefined(
+            profile.summaryPromptPath ?? DEFAULT_SUMMARY_PROMPT_FILE
+          );
+          built.push(createMotionSummarizationMiddleware({ llm, summaryPrompt }));
           enabled.push(entry);
           break;
+        }
         case 'observability': {
           const obs = profile.observability;
           if (!obs?.verbose) {
@@ -74,6 +90,10 @@ const config = {
   ...DEFAULT_CONFIG,
   llm,
   noDefaultPrompts: true,
+  // The behavioural system prompt rides in gaunt-sloth's `projectGuidelines`
+  // slot (a configurable filename), letting us use a clean `system-prompt.md`
+  // instead of the hardcoded `.gsloth.system.md`.
+  projectGuidelines: profile.systemPromptPath ?? DEFAULT_SYSTEM_PROMPT_FILE,
   tools: [captureImageTool, ...createRobotTools(robotHost)],
   middleware,
   commands: {

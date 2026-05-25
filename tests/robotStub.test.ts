@@ -81,16 +81,6 @@ describe('Movement endpoints', () => {
   })
 })
 
-describe('Stop endpoint', () => {
-  it('records stop with 0 steps', async () => {
-    const res = await fetch(`${baseUrl}/stop`)
-    expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ action: 'stop' })
-    expect(state.lastCommand).toBe('stop')
-    expect(state.lastSteps).toBe(0)
-  })
-})
-
 describe('Distance endpoint', () => {
   it('returns numeric string with one decimal', async () => {
     const res = await fetch(`${baseUrl}/distance`)
@@ -144,13 +134,13 @@ describe('Command history', () => {
     await fetch(`${baseUrl}/forward`)
     await fetch(`${baseUrl}/turn_left?steps=8`)
     await fetch(`${baseUrl}/forward?steps=2`)
-    await fetch(`${baseUrl}/stop`)
+    await fetch(`${baseUrl}/backward`)
 
     expect(state.commandHistory).toHaveLength(4)
     expect(state.commandHistory[0].name).toBe('forward')
     expect(state.commandHistory[1]).toMatchObject({ name: 'turn_left', steps: 8 })
     expect(state.commandHistory[2]).toMatchObject({ name: 'forward', steps: 2 })
-    expect(state.commandHistory[3].name).toBe('stop')
+    expect(state.commandHistory[3].name).toBe('backward')
   })
 })
 

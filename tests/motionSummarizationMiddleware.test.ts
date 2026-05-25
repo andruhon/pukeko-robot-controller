@@ -10,6 +10,7 @@ import {
 import {
   createMotionSummarizationMiddleware,
   __pendingSummariesForTest,
+  __motionLogForTest,
 } from '../src/agent/motionSummarizationMiddleware.js'
 
 interface HookContainer {
@@ -43,6 +44,7 @@ function imageBlock() {
 
 beforeEach(() => {
   __pendingSummariesForTest.clear()
+  __motionLogForTest.clear()
 })
 
 describe('motionSummarizationMiddleware', () => {
@@ -158,6 +160,79 @@ describe('motionSummarizationMiddleware', () => {
         }
       }
     }
+  })
+
+  it('uses a provided summaryPrompt override as the first system message', async () => {
+    const llm = makeStubLlm()
+    const mw = createMotionSummarizationMiddleware({
+      llm,
+      summaryPrompt: 'CUSTOM SUMMARY PROMPT',
+    }) as HookContainer
+    const after = getHook(mw.afterModel)
+
+    const userMsg = new HumanMessage('Find the red cone.')
+    const aiMotion = new AIMessage({
+      content: '',
+      tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'tc' }],
+    })
+
+    await after({ messages: [userMsg, aiMotion] }, runtime)
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    const sanitizedInput = llm.invoke.mock.calls[0][0] as BaseMessage[]
+    expect(sanitizedInput[0]).toBeInstanceOf(SystemMessage)
+    expect((sanitizedInput[0] as SystemMessage).content).toBe('CUSTOM SUMMARY PROMPT')
+  })
+
+  it('logs motions, marking the previous done and the newest pending', async () => {
+    const llm = makeStubLlm()
+    const mw = createMotionSummarizationMiddleware({ llm }) as HookContainer
+    const after = getHook(mw.afterModel)
+
+    const userMsg = new HumanMessage('go')
+    const tr = new AIMessage({ content: '', tool_calls: [{ name: 'turn_right', args: { steps: 3 }, id: 'a' }] })
+    await after({ messages: [userMsg, tr] }, runtime)
+    const fwd = new AIMessage({ content: '', tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'b' }] })
+    await after({ messages: [userMsg, tr, fwd] }, runtime)
+
+    expect(__motionLogForTest.get('test-thread')).toEqual([
+      { label: 'turn_right (steps=3)', pending: false },
+      { label: 'move_forward (steps=2)', pending: true },
+    ])
+  })
+
+  it('appends a deterministic recent-motions list to the summary, newest pending', async () => {
+    const llm = makeStubLlm()
+    const mw = createMotionSummarizationMiddleware({ llm }) as HookContainer
+    const after = getHook(mw.afterModel)
+    const before = getHook(mw.beforeModel)
+
+    const userMsg = new HumanMessage('Get the robot to the red cone.')
+    const noise: BaseMessage[] = [
+      new AIMessage('Looking.'),
+      new AIMessage({ content: '', tool_calls: [{ name: 'capture_image', args: {}, id: 'tc-0' }] }),
+      new ToolMessage({ content: JSON.stringify({ mimeType: 'image/jpeg', data: 'A' }), tool_call_id: 'tc-0', name: 'capture_image' }),
+      new HumanMessage({ content: [{ type: 'text', text: 'frame' }, imageBlock()] }),
+    ]
+    const motionAi = new AIMessage({ content: '', tool_calls: [{ name: 'turn_right', args: { steps: 3 }, id: 'tc-m' }] })
+    const motionTool = new ToolMessage({
+      content: JSON.stringify({ mimeType: 'image/jpeg', data: 'C', motion: 'turn_right (steps=3)' }),
+      tool_call_id: 'tc-m',
+      name: 'turn_right',
+    })
+    const composite = new HumanMessage({
+      content: [{ type: 'text', text: 'Before/After frames for turn_right (steps=3).' }, imageBlock()],
+    })
+
+    const messagesAfter = [userMsg, ...noise, motionAi]
+    await after({ messages: messagesAfter }, runtime)
+    const result = await before({ messages: [...messagesAfter, motionTool, composite] }, runtime)
+
+    const updated = (result as { messages: BaseMessage[] }).messages
+    const summaryMsg = updated[2] as SystemMessage
+    expect(summaryMsg.content).toContain('Recent motions (newest last):')
+    expect(summaryMsg.content).toContain('turn_right (steps=3) (pending')
   })
 
   it('beforeModel is a no-op when no summary is pending', async () => {

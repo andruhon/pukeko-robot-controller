@@ -32,7 +32,8 @@ Real robot: skip `npm run stub` and connect to the robot's Wi-Fi AP. Set `ROBOT_
 
 - Default model: Gemma 4 via Ollama (`OLLAMA_MODEL=gemma4:31b`). Optimized for small models — the motion-tools auto-capture + summarization combo means the LLM doesn't have to remember to bracket motions with `capture_image` and the context window stays trim.
 - Parallel tool calls are **disabled** on Anthropic (`disable_parallel_tool_use: true` in `server/createLlm.ts`) because client-fulfilled tools rely on a LangGraph interrupt and parallel batching breaks the resume ordering.
-- The agent's behavioural prompt lives in `.gsloth.system.md` (the operating mindset, calibration sequence, distance-sensor caveats). Update there, not in code, when changing how the agent thinks.
+- The agent's behavioural prompt lives in `system-prompt.md` at the repo root (the operating mindset, calibration sequence, distance-sensor caveats). Update there, not in code, when changing how the agent thinks. It's loaded via gaunt-sloth's configurable `projectGuidelines` slot (set in `server/index.ts`), overridable per profile with `systemPromptPath`.
+- The motion-summarization prompt lives in `summarization-prompt.md` at the repo root (what each compressed history must carry forward — objective, calibration outcomes, action log, findings). Overridable per profile with `summaryPromptPath`. `src/agent/motionSummarizationMiddleware.ts` keeps an identical `DEFAULT_SUMMARY_PROMPT` as a fallback for when the file is absent — keep the two in sync.
 - Briefs in `_briefs/` describe planned/completed work. `01-*` documented the `capture_image` interrupt/resume flow; `02-*` documented the motion-tool auto-capture and summarization work that this AGENTS.md describes.
 
 ## Tests

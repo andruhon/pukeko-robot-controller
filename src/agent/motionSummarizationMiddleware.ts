@@ -24,21 +24,75 @@ const MOTION_NAMES: ReadonlySet<string> = new Set(MOTION_TOOL_NAMES);
 // summarization wall-clock parallelism with the motion itself.
 const pendingSummaries = new Map<string, Promise<string>>();
 
-const SUMMARY_SYSTEM_PROMPT = `You are compressing a robot-control conversation log so a small local model can stay on task.
+// thread_id → ordered list of motions issued, newest last. Appended to the
+// summary verbatim so the recent-move history is deterministic (immune to LLM
+// summary drift). The newest entry is the in-flight motion — marked pending
+// until the next turn observes its result.
+interface MotionEntry {
+  label: string;
+  pending: boolean;
+}
+const motionLogByThread = new Map<string, MotionEntry[]>();
+const MAX_MOTION_LOG = 5;
 
-Produce a concise summary covering:
-- The user's original objective (state it verbatim if short, otherwise quote the goal).
-- Robot state evolution: which motion commands ran, sensor readings before/after, what the assistant decided each step.
-- Constraints, obstacles, or hypotheses raised so far.
+// Baked-in fallback. Kept identical to `summarization-prompt.md` at the repo
+// root, which the server loads and passes in via `summaryPrompt`. This copy is
+// used only when that file is missing.
+const DEFAULT_SUMMARY_PROMPT = `You are compressing a robot-control conversation log so a small local model can stay on task. The summary REPLACES the detailed history, so capture the operator's understanding so far — conclusions, not a play-by-play.
+
+Cover, in a few terse sentences:
+- The user's objective (verbatim if short).
+- What has been learned about the controls in this camera view: which on-screen direction each turn produces (and whether turn_left/turn_right are inverted here), which end is the robot's face, and the rough movement scale.
+- Where the robot currently is and which way it is facing relative to the target, and the intended next move.
+- Open questions, obstacles, or sensor caveats (e.g. a flat or thin target the ultrasonic can't see).
 
 Rules:
-- DO NOT describe image content. Do not write "the photo shows...".
-- DO NOT include base64 data, image URLs, or content blocks.
-- Maximum 8 short sentences.
-- Past tense. Plain text only.`;
+- Write conclusions and current state, NOT a list of the commands issued — recent moves are tracked separately and appended for you.
+- Do NOT describe raw image content ("the photo shows..."), and do NOT include base64 data or image URLs.
+- Plain text, terse, present tense.`;
 
 interface MaybeToolCall {
   name?: unknown;
+  args?: unknown;
+}
+
+// Human-readable label for the motion a message just issued, e.g.
+// "turn_right (steps=3)". Returns null when the message has no motion call.
+function motionLabel(msg: unknown): string | null {
+  if (!msg || typeof msg !== 'object') return null;
+  const tcs = (msg as { tool_calls?: unknown }).tool_calls;
+  if (!Array.isArray(tcs)) return null;
+  for (const tc of tcs as MaybeToolCall[]) {
+    if (typeof tc?.name === 'string' && MOTION_NAMES.has(tc.name)) {
+      const rawSteps = (tc.args as { steps?: unknown } | undefined)?.steps;
+      const n =
+        typeof rawSteps === 'number' && Number.isFinite(rawSteps) && rawSteps >= 1
+          ? Math.floor(rawSteps)
+          : 1;
+      return n > 1 ? `${tc.name} (steps=${n})` : tc.name;
+    }
+  }
+  return null;
+}
+
+// Record a freshly-issued motion: the previously pending one is now resolved
+// (its result was observed last turn), and this one becomes the new pending.
+function recordMotion(threadId: string, label: string): void {
+  const log = motionLogByThread.get(threadId) ?? [];
+  for (const e of log) e.pending = false;
+  log.push({ label, pending: true });
+  while (log.length > MAX_MOTION_LOG) log.shift();
+  motionLogByThread.set(threadId, log);
+}
+
+function formatMotionLog(threadId: string): string {
+  const log = motionLogByThread.get(threadId);
+  if (!log || log.length === 0) return '';
+  const lines = log.map(
+    (e) =>
+      `- ${e.label}${e.pending ? ' (pending — its result is the latest Before/After frame below)' : ''}`
+  );
+  return `Recent motions (newest last):\n${lines.join('\n')}`;
 }
 
 function isMotionToolCall(msg: unknown): boolean {
@@ -97,9 +151,13 @@ function extractText(content: BaseMessage['content']): string {
 
 export interface MotionSummarizationOptions {
   llm: BaseChatModel;
+  // Override for the summarization system prompt. Falls back to
+  // DEFAULT_SUMMARY_PROMPT when omitted.
+  summaryPrompt?: string;
 }
 
 export function createMotionSummarizationMiddleware(opts: MotionSummarizationOptions) {
+  const summaryPrompt = opts.summaryPrompt ?? DEFAULT_SUMMARY_PROMPT;
   return createMiddleware({
     name: 'motion-summarization',
 
@@ -110,6 +168,10 @@ export function createMotionSummarizationMiddleware(opts: MotionSummarizationOpt
       if (!isMotionToolCall(last)) return undefined;
 
       const threadId = runtime?.configurable?.thread_id ?? '__default__';
+      // Log the motion for the deterministic recent-moves list — always, even
+      // when a summary is already in flight (the guard below only skips the
+      // expensive LLM call, not the bookkeeping).
+      recordMotion(threadId, motionLabel(last) ?? 'motion');
       if (pendingSummaries.has(threadId)) return undefined;
 
       const sanitized = messages.map(stripImageBlocks);
@@ -121,7 +183,7 @@ export function createMotionSummarizationMiddleware(opts: MotionSummarizationOpt
           // controller for the original turn and spam ERR_INVALID_STATE.
           const result = await opts.llm.invoke(
             [
-              new SystemMessage(SUMMARY_SYSTEM_PROMPT),
+              new SystemMessage(summaryPrompt),
               ...sanitized,
               new HumanMessage('Write the summary now.'),
             ],
@@ -161,9 +223,13 @@ export function createMotionSummarizationMiddleware(opts: MotionSummarizationOpt
 
       const head = messages.slice(0, firstHumanIdx + 1);
       const tail = messages.slice(lastMotionIdx);
+      const motionList = formatMotionLog(threadId);
+      const summaryBody = motionList
+        ? `Summary of prior steps:\n${summary}\n\n${motionList}`
+        : `Summary of prior steps:\n${summary}`;
       const replaced: BaseMessage[] = [
         ...head,
-        new SystemMessage(`Summary of prior steps:\n${summary}`),
+        new SystemMessage(summaryBody),
         ...tail,
       ];
 
@@ -179,3 +245,4 @@ export function createMotionSummarizationMiddleware(opts: MotionSummarizationOpt
 
 // Exposed for tests; do not call from app code.
 export const __pendingSummariesForTest = pendingSummaries;
+export const __motionLogForTest = motionLogByThread;

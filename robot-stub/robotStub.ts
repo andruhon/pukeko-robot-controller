@@ -100,11 +100,6 @@ export function createRobotStubApp(state?: RobotState): { app: Express; state: R
     res.type('text/plain').send(distance.toFixed(1))
   })
 
-  app.get('/stop', (_req, res) => {
-    recordCommand(robotState, 'stop', 0)
-    res.json({ action: 'stop' })
-  })
-
   for (const path of MOVEMENT_ENDPOINTS) {
     app.get(path, (req: Request, res: Response) => {
       const name = path.slice(1)
