@@ -109,6 +109,9 @@ const middleware = buildMiddleware(profile.middleware, llm, profile);
 const config = {
   ...DEFAULT_CONFIG,
   llm,
+  // Surfaced by the AG-UI server's /info endpoint so the frontend can show the
+  // active model (provider comes from the model's _llmType()).
+  modelDisplayName: profile.llm.model,
   noDefaultPrompts: true,
   // The behavioural system prompt rides in gaunt-sloth's `projectGuidelines`
   // slot (a configurable filename), letting us use a clean `system-prompt.md`

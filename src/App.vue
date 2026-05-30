@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import {
   ChatInterface,
   PkButton,
@@ -178,6 +178,32 @@ function emergencyStop() {
 function startNewConversation() {
   chatInterfaceRef.value?.clearHistory()
 }
+
+// Provider/model label shown in the nav header, fetched live from the AG-UI
+// server's /info endpoint so it always reflects the running profile (including
+// env overrides), rather than a duplicated build-time constant.
+const agentLabel = ref('')
+
+async function loadAgentInfo() {
+  try {
+    const buildUrl = typeof __AGUI_URL__ !== 'undefined' ? __AGUI_URL__ : ''
+    let agUiUrl = buildUrl
+    if (!agUiUrl) {
+      const cfgRes = await fetch('/config.json')
+      if (cfgRes.ok) agUiUrl = (await cfgRes.json()).agUiUrl ?? ''
+    }
+    if (!agUiUrl) return
+    const base = agUiUrl.replace(/\/agents\/.*$/, '')
+    const res = await fetch(`${base}/info`)
+    if (!res.ok) return
+    const info = (await res.json()) as { provider?: string | null; model?: string | null }
+    agentLabel.value = [info.provider, info.model].filter(Boolean).join(' ')
+  } catch (err) {
+    console.warn('[App] Failed to load agent info:', err)
+  }
+}
+
+onMounted(loadAgentInfo)
 </script>
 
 <template>
@@ -188,6 +214,7 @@ function startNewConversation() {
         <span class="app-title">Pukeko Robot Controller</span>
       </template>
       <template #nav-controls>
+        <span v-if="agentLabel" class="agent-label">Model: {{ agentLabel }}</span>
         <PkButton class="header-action" @click="startNewConversation">New conversation</PkButton>
         <PkButton class="header-action stop" @click="emergencyStop">Emergency stop</PkButton>
       </template>
@@ -220,6 +247,18 @@ function startNewConversation() {
   font-weight: 600;
   color: var(--main-text-color);
   margin-left: var(--padding-third);
+}
+
+.agent-label {
+  /* Noticeable gap between the model label and the action buttons. */
+  display: flex;
+  align-items: center;
+  margin-right: 2rem;
+  font-size: 1.1rem;
+  font-weight: 500;
+  color: var(--main-text-color);
+  white-space: nowrap;
+  opacity: 0.85;
 }
 
 .header-action.stop :deep(button) {
