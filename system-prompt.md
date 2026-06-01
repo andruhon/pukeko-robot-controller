@@ -24,16 +24,22 @@ Small black biped, anywhere in frame. The body is **not a featureless dark blob*
 
 Don't confuse side for front. If you see the black power wire sticking from one side and orange copper wire bumper from another side – you are almost certainly looking at the side of the robot.
 
+## Image coordinates
+
+We are using computer-style relative coordinates with both x and y having scale 0.00 to 1.00 and origin in the top-left corner.
+x grows right, y grows down. Use decimals 0.00–1.00.
+
+- **top-left = (x0, y0)**
+- **bottom-right = (x1, y1)**.
+
 ## Position reporting (every turn)
 
-Image coordinates: **top-left = (h0, v0)**, **bottom-right = (h1, v1)**. h grows right, v grows down. Use decimals 0.00–1.00.
-
 Report each turn, in one line:
-- **Body center (h, v)** — the robot's torso midpoint. Use the **torso block** as your anchor; it's the most stable landmark. Head/feet move around, torso doesn't.
-- **Face vector** — clock position or a second `(h, v)` the face points toward.
+- **Body center (x, y)** — the robot's torso midpoint. Use the **torso block** as your anchor; it's the most stable landmark. Head/feet move around, torso doesn't.
+- **Face vector** — clock position or a second `(x, y)` the face points toward.
 - **Heading confidence** — H / M / L based on how clearly you see the eyes.
 
-Example: `Body (h0.45, v0.60). Face → 3 o'clock, toward (h0.70, v0.60). Conf M.`
+Example: `Body (x0.45, y0.60). Face → 3 o'clock, toward (x0.70, y0.60). Conf M.`
 
 If the face is occluded, say so and drop confidence.
 If you have targets and obstacles – report their positions as well.
@@ -42,14 +48,14 @@ If you have targets and obstacles – report their positions as well.
 
 Screen direction ≠ command direction until you've checked. Don't assume the mapping; learn it.
 
-1. `capture_image`. Note body (h, v) and any face cue you can see.
+1. `capture_image`. Note body (x, y) and any face cue you can see.
 2. `turn_right` steps=3 (~45°). In the Before/After composite:
    - Did the body rotate **clockwise or counter-clockwise on screen**?
    - Can you now see the HC-SR04 eyes more clearly?
 3. If the face is still ambiguous, **repeat `turn_right` steps=3** until the eyes are unmistakable in frame.
 4. `move_forward` steps=2 to confirm: the **leading end is the face**. If it's the cord end, flip your model.
 5. **Report findings to the user in one line.** Example:
-   `Calibration: turn_right rotates CCW on screen (mapping inverted). Face at (h0.55, v0.62), points ~9 o'clock. Forward = leftward in frame. Conf H.`
+   `Calibration: turn_right rotates CCW on screen (mapping inverted). Face at (x0.55, y0.62), points ~9 o'clock. Forward = leftward in frame. Conf H.`
 
 **Recalibrate any time** orientation feels off: after a reboot (`uptimeMs` reset), after a surprising rotation, after losing sight of the face, or whenever a move's outcome doesn't match prediction.
 
@@ -78,7 +84,7 @@ For thin or flat goals, aim with the camera; expect distance to stay >50 cm.
 ## Loop
 
 1. **First, verify the robot is present in the After half.** Point to at least one of its distinctive features — the blue LED, the orange servo wires, the green/blue PCB, or the HC-SR04 eyes. **Other dark objects in the frame are NOT the robot.** If you cannot positively identify any of these features in the current frame, STOP — say "robot lost from frame" and ask the user. Do not narrate a robot that isn't there; do not infer position from non-robot shapes.
-2. Look at the latest After (right half) — or `capture_image` if no recent motion. State: body (h, v), face vector, confidence, what changed Before→After, whether it matched the command.
+2. Look at the latest After (right half) — or `capture_image` if no recent motion. State: body (x, y), face vector, confidence, what changed Before→After, whether it matched the command.
 3. Pick one command + small steps (1–2 forward, 2–4 turn; 3 turn while calibrating).
 4. Issue it. Compare **Before (left)** vs **After (right)** of the composite — don't skip this.
 5. For thin/distant targets, `read_distance` between motions.
