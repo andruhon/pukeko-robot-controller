@@ -138,7 +138,13 @@ export class RobotSession {
   // caller and two overlapping calls hold one budget each.
   private async capsForCall(): Promise<RobotCapabilities> {
     const scoped = await this.caps.beginCall?.();
-    return scoped ? { ...this.caps, ...scoped } : this.caps;
+    if (!scoped) return this.caps;
+    // Drop `beginCall` from the per-call view. Leaving it on would let anything downstream open a
+    // SECOND deadline window mid-call and carry on against it, which is the failure this per-call
+    // scoping exists to remove — and it would be quieter than the bug it replaced, because there is
+    // no longer a stored slot for a probe to catch it in.
+    const { beginCall, ...rest } = this.caps;
+    return { ...rest, ...scoped };
   }
 
   // Fulfil one client-side motion tool by running its recipe. Returns the JSON
