@@ -6,6 +6,8 @@ import {
   SystemMessage,
   ToolMessage,
   RemoveMessage,
+  isHumanMessage,
+  isSystemMessage,
   type BaseMessage,
 } from '@langchain/core/messages'
 import { MemorySaver, messagesStateReducer } from '@langchain/langgraph'
@@ -14,7 +16,7 @@ import {
   estimateTokens,
   __inflightSummariesForTest,
 } from '../src/agent/contextPrunerMiddleware.js'
-import { __resetMotionLogForTest } from '../src/agent/motionLog.js'
+import { __resetMotionLogForTest, isMotionToolCall } from '../src/agent/motionLog.js'
 
 interface HookContainer {
   beforeModel?: unknown
@@ -1319,5 +1321,323 @@ describe('contextPrunerMiddleware — RC-29 human image-block prune preserves th
     expect(llm.invoke).toHaveBeenCalledTimes(1)
     const sanitized = llm.invoke.mock.calls[0][0] as BaseMessage[]
     expect(sanitized.find((m) => m.id === 'h-text')).toBe(textArray)
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────────────
+// RC-27 — a session with no motion call must still prune
+//
+// The summarize path was guarded on `lastMotionAiIdx > firstHumanIdx + 1`. In a
+// session that never issues a motion call — capture and narrate, question
+// answering, any read-only interaction — `lastMotionAiIdx` never leaves its -1
+// sentinel, so the guard could never hold: the middleware summarized nothing,
+// ever, and context grew to the hard cap with nothing saying why.
+//
+// The trap, and the reason these tests are shaped the way they are: the broken
+// behaviour satisfies any test that only checks pruning is CORRECT when it
+// happens. Every summarization test above supplies a motion call, so all of them
+// passed while the no-motion case was dead. The test that matters is therefore
+// that a motion-free history over the threshold DOES summarize.
+//
+// The motion anchor is pinned in the same block, because the obvious wrong way
+// to make the first test pass is to drop the anchor and summarize up to the end
+// unconditionally — which would let the summarizer eat the state the most recent
+// motion turn depends on. Nothing else in this file would report that.
+//
+// Message classes are compared by reference or by prototype, never `instanceof`:
+// this repo resolves two copies of @langchain/core (see the RC-29 header).
+// ───────────────────────────────────────────────────────────────────────────
+describe('contextPrunerMiddleware — RC-27 a session with no motion call still prunes', () => {
+  // Threshold = 500 estimated tokens; image blocks charged cheaply so the
+  // histories below cross on their text, which is what the fixtures control.
+  const OVER_THRESHOLD = {
+    maxContextTokens: 1000,
+    summarizeAtFraction: 0.5,
+    imageTokenBudget: 50,
+  } as const
+
+  function captureResultJson(dataLen = 400): string {
+    return JSON.stringify({ mimeType: 'image/jpeg', data: 'X'.repeat(dataLen), captured: true })
+  }
+
+  function summaryMessages(messages: BaseMessage[]): HumanMessage[] {
+    return messages.filter(
+      (m): m is HumanMessage =>
+        isHumanMessage(m) && String(m.content).startsWith('[Context summary]')
+    )
+  }
+
+  function withoutRemoveMessages(result: unknown): BaseMessage[] {
+    return (result as { messages: BaseMessage[] }).messages.filter(
+      (m) => Object.getPrototypeOf(m) !== RemoveMessage.prototype
+    )
+  }
+
+  // A capture-and-narrate session: the model looks, describes what it sees, and
+  // looks again. Not one motion call anywhere — this is a normal way to use the
+  // robot, not a degenerate history.
+  function narrationHistory(cycles = 5): { user: HumanMessage; messages: BaseMessage[] } {
+    const user = new HumanMessage({
+      id: 'h-user',
+      content: 'Look around and tell me what you can see.',
+    })
+    const messages: BaseMessage[] = [user]
+    for (let i = 0; i < cycles; i++) {
+      messages.push(
+        new AIMessage({
+          id: `ai-capture-${i}`,
+          content: '',
+          tool_calls: [{ name: 'capture_image', args: {}, id: `tc-cap-${i}` }],
+        })
+      )
+      messages.push(
+        new ToolMessage({
+          id: `tm-cap-${i}`,
+          content: captureResultJson(),
+          tool_call_id: `tc-cap-${i}`,
+          name: 'capture_image',
+        })
+      )
+      messages.push(
+        new HumanMessage({
+          id: `h-frame-${i}`,
+          content: [{ type: 'text', text: `Frame ${i}.` }, imageBlock()],
+        })
+      )
+      messages.push(new AIMessage({ id: `ai-narrate-${i}`, content: 'N'.repeat(400) }))
+    }
+    return { user, messages }
+  }
+
+  it('THE DEFECT: a motion-free history over the threshold IS summarized', async () => {
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const { user, messages } = narrationHistory()
+    // No message in this history carries a motion tool call — the condition the
+    // old guard could not survive.
+    expect(messages.some((m) => isMotionToolCall(m))).toBe(false)
+
+    const result = await before({ messages }, runtime)
+
+    // It summarized at all. This is the assertion the old code failed.
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    expect(result).toBeTruthy()
+
+    const rebuilt = withoutRemoveMessages(result)
+    // Anchored at the first human message: it survives verbatim, by reference,
+    // and everything after it is replaced by the single summary.
+    expect(rebuilt).toHaveLength(2)
+    expect(rebuilt[0]).toBe(user)
+    const summaries = summaryMessages(rebuilt)
+    expect(summaries).toHaveLength(1)
+    expect(summaries[0]).toBe(rebuilt[1])
+    expect(String(summaries[0].content)).toContain(SUMMARY_TEXT)
+    // The summary rides as a HumanMessage (RC-17): a SystemMessage at index ≥ 1
+    // is rejected outright by @langchain/anthropic.
+    expect(isHumanMessage(summaries[0])).toBe(true)
+    expect(rebuilt.some((m) => isSystemMessage(m))).toBe(false)
+    // No motion ran, so there is no pinned motion log to append.
+    expect(String(summaries[0].content)).not.toContain('Recent motions')
+  })
+
+  it('the whole history after the first human message is what the summarizer is given', async () => {
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const { user, messages } = narrationHistory()
+    await before({ messages }, runtime)
+
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    const sent = llm.invoke.mock.calls[0][0] as BaseMessage[]
+    // [system prompt, first human, ...head slice, "Write the summary now."]
+    expect(isSystemMessage(sent[0])).toBe(true)
+    expect(sent[1].content).toBe(user.content)
+    const sentIds = sent.map((m) => m.id)
+    // The newest turn is in the head too — with no motion call there is no state
+    // for a tail to protect, so nothing is held back.
+    expect(sentIds).toContain('ai-capture-0')
+    expect(sentIds).toContain('ai-narrate-4')
+    expect(sentIds).toContain('h-frame-4')
+  })
+
+  it('the ordinary threshold still governs: a motion-free history under it is not summarized', async () => {
+    // Discriminates the fix from "always summarize when there is no motion".
+    // The history has real mechanical pruning to do (an aged-out image), so a
+    // rewrite IS emitted — it just carries no summary.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const messages: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'What do you see?' }),
+      new HumanMessage({ id: 'h-old', content: [{ type: 'text', text: 'Frame 0.' }, imageBlock()] }),
+      new HumanMessage({ id: 'h-new', content: [{ type: 'text', text: 'Frame 1.' }, imageBlock()] }),
+      new AIMessage({ id: 'ai-1', content: 'A cone, about half a metre ahead.' }),
+    ]
+    expect(messages.some((m) => isMotionToolCall(m))).toBe(false)
+
+    const result = await before({ messages }, runtime)
+
+    expect(llm.invoke).not.toHaveBeenCalled()
+    const rebuilt = withoutRemoveMessages(result)
+    expect(summaryMessages(rebuilt)).toHaveLength(0)
+    expect(rebuilt.map((m) => m.id)).toEqual(['h-user', 'h-old', 'h-new', 'ai-1'])
+  })
+
+  it('the boundary is the first HUMAN message, not index 0: a leading system message survives in place', async () => {
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const system = new SystemMessage({ id: 'sys', content: 'agent system prompt' })
+    const { user, messages } = narrationHistory()
+    const result = await before({ messages: [system, ...messages] }, runtime)
+
+    const rebuilt = withoutRemoveMessages(result)
+    expect(rebuilt).toHaveLength(3)
+    expect(rebuilt[0]).toBe(system)
+    expect(rebuilt[1]).toBe(user)
+    expect(summaryMessages(rebuilt)).toHaveLength(1)
+    // The Anthropic invariant: no SystemMessage past index 0.
+    expect(rebuilt.slice(1).some((m) => isSystemMessage(m))).toBe(false)
+  })
+
+  it('two no-motion prune cycles: the summary is folded, not accumulated', async () => {
+    let n = 0
+    const invoke = vi.fn(async () => ({ content: `summary ${++n}: the robot described the room.` }))
+    const llm = { invoke } as unknown as Parameters<typeof createContextPrunerMiddleware>[0]['llm'] & {
+      invoke: ReturnType<typeof vi.fn>
+    }
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const { user, messages } = narrationHistory()
+    const cycle1 = withoutRemoveMessages(await before({ messages }, runtime))
+    expect(String(summaryMessages(cycle1)[0].content)).toContain('summary 1')
+
+    // The session carries on narrating off the rebuilt state, still motion-free.
+    const { messages: more } = narrationHistory()
+    const cycle2Input = [...cycle1, ...more.slice(1)]
+    const cycle2 = withoutRemoveMessages(await before({ messages: cycle2Input }, runtime))
+
+    expect(invoke).toHaveBeenCalledTimes(2)
+    expect(cycle2).toHaveLength(2)
+    expect(cycle2[0]).toBe(user)
+    const folded = summaryMessages(cycle2)
+    expect(folded).toHaveLength(1)
+    expect(String(folded[0].content)).toContain('summary 2')
+    expect(String(folded[0].content)).not.toContain('summary 1')
+  })
+
+  it('MOTION ANCHOR PINNED: with a motion call, the summary still stops at the last motion turn', async () => {
+    // The guard against the wrong fix. If the no-motion branch were implemented
+    // by summarizing to the end of the history unconditionally, this reads as
+    // two messages instead of eight and the motion state the tail protects is
+    // gone. Two motions, so the anchor is provably the LAST one.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const user = new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' })
+    const filler: BaseMessage[] = []
+    for (let i = 0; i < 4; i++) filler.push(new AIMessage({ id: `ai-fill-${i}`, content: 'F'.repeat(400) }))
+    const earlyMotionAi = new AIMessage({
+      id: 'ai-motion-early',
+      content: '',
+      tool_calls: [{ name: 'turn_right', args: { steps: 1 }, id: 'tc-early' }],
+    })
+    const earlyMotionTool = new ToolMessage({
+      id: 'tm-motion-early',
+      content: motionResultJson('turn_right (steps=1)', 200),
+      tool_call_id: 'tc-early',
+      name: 'turn_right',
+    })
+    const earlyComposite = new HumanMessage({
+      id: 'h-early-frame',
+      content: [{ type: 'text', text: 'Before/After frames for turn_right (steps=1).' }, imageBlock()],
+    })
+    const lastMotionAi = new AIMessage({
+      id: 'ai-motion-last',
+      content: '',
+      tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'tc-last' }],
+    })
+    const lastMotionTool = new ToolMessage({
+      id: 'tm-motion-last',
+      content: motionResultJson('move_forward (steps=2)', 200),
+      tool_call_id: 'tc-last',
+      name: 'move_forward',
+    })
+    const lastComposite = new HumanMessage({
+      id: 'h-last-frame',
+      content: [{ type: 'text', text: 'Before/After frames for move_forward (steps=2).' }, imageBlock()],
+    })
+    // Non-motion turns AFTER the anchor: these must ride in the tail too, so the
+    // anchor cannot be confused with "the last message".
+    const laterAi = new AIMessage({ id: 'ai-later', content: 'Closer now. Checking the view.' })
+    const laterCaptureAi = new AIMessage({
+      id: 'ai-later-capture',
+      content: '',
+      tool_calls: [{ name: 'capture_image', args: {}, id: 'tc-later-cap' }],
+    })
+    const laterCaptureTool = new ToolMessage({
+      id: 'tm-later-capture',
+      content: captureResultJson(200),
+      tool_call_id: 'tc-later-cap',
+      name: 'capture_image',
+    })
+
+    const result = await before(
+      {
+        messages: [
+          user,
+          ...filler,
+          earlyMotionAi,
+          earlyMotionTool,
+          earlyComposite,
+          lastMotionAi,
+          lastMotionTool,
+          lastComposite,
+          laterAi,
+          laterCaptureAi,
+          laterCaptureTool,
+        ],
+      },
+      runtime
+    )
+
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    const rebuilt = withoutRemoveMessages(result)
+    expect(rebuilt.map((m) => m.id)).toEqual([
+      'h-user',
+      undefined, // the summary message, which carries no id
+      'ai-motion-last',
+      'tm-motion-last',
+      'h-last-frame',
+      'ai-later',
+      'ai-later-capture',
+      'tm-later-capture',
+    ])
+    // The tail is the original objects, not re-described ones — except the two
+    // image-bearing ToolMessages, which are copies by design because the
+    // mechanical strip drops their base64 frame.
+    expect(rebuilt[0]).toBe(user)
+    expect(rebuilt[2]).toBe(lastMotionAi)
+    expect(rebuilt[4]).toBe(lastComposite)
+    expect(rebuilt[5]).toBe(laterAi)
+    expect(rebuilt[6]).toBe(laterCaptureAi)
+    expect(JSON.parse(rebuilt[7].content as string)).toEqual({
+      mimeType: 'image/jpeg',
+      captured: true,
+      dataDropped: true,
+    })
+    // Everything before the anchor was eaten, including the earlier motion turn…
+    expect(rebuilt).not.toContain(earlyMotionAi)
+    // …and it went to the summarizer, which is where it was supposed to go.
+    const sentIds = (llm.invoke.mock.calls[0][0] as BaseMessage[]).map((m) => m.id)
+    expect(sentIds).toContain('ai-motion-early')
+    expect(sentIds).not.toContain('ai-motion-last')
   })
 })

@@ -395,10 +395,9 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
       let summaryMs = 0;
 
       if (afterPruneTokens >= summarizeThreshold) {
-        // Carve out the head slice — everything from the first HumanMessage
-        // through the message just before the most recent motion ToolMessage's
-        // assistant call. The tail (latest motion AIMessage → ToolMessage →
-        // injected composite, plus anything newer) survives verbatim.
+        // Carve out the head slice — everything from the first HumanMessage up
+        // to the summary boundary. Whatever sits at or after that boundary is
+        // the tail, and survives verbatim.
         const firstHumanIdx = pruned.findIndex((m) => isHumanMessage(m));
         let lastMotionAiIdx = -1;
         for (let i = pruned.length - 1; i >= 0; i--) {
@@ -408,9 +407,29 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
           }
         }
 
-        if (firstHumanIdx >= 0 && lastMotionAiIdx > firstHumanIdx + 1) {
-          const headSlice = pruned.slice(firstHumanIdx + 1, lastMotionAiIdx);
-          const tail = pruned.slice(lastMotionAiIdx);
+        // Where the boundary sits. Two cases, and a session with NO motion call
+        // anywhere is a real one — capture and narrate, question answering, any
+        // read-only interaction — not a degenerate history.
+        //
+        // With a motion call, the boundary is that call: the anchor exists so
+        // summarization cannot eat the state the motion turn depends on, so the
+        // motion AIMessage, its ToolMessage and the injected Before/After
+        // composite (plus anything newer) are held back from the summarizer.
+        //
+        // With no motion call there is no such state to protect, so no anchor is
+        // needed and none is invented — the first HumanMessage stays as the
+        // boundary and everything after it is summarized. That is deliberate:
+        // the alternative is what this branch replaces, where the motion
+        // comparison could never hold against an unmoved sentinel and the
+        // middleware silently never summarized at all, letting context grow to
+        // the hard cap. Cutting at the very end cannot orphan a tool call from
+        // its result either — the whole tail goes, or none of it does.
+        const hasMotion = lastMotionAiIdx >= 0;
+        const boundaryIdx = hasMotion ? lastMotionAiIdx : pruned.length;
+
+        if (firstHumanIdx >= 0 && boundaryIdx > firstHumanIdx + 1) {
+          const headSlice = pruned.slice(firstHumanIdx + 1, boundaryIdx);
+          const tail = pruned.slice(boundaryIdx);
           const firstHuman = pruned[firstHumanIdx];
 
           // Deduplicate concurrent in-flight summaries per thread.
@@ -424,6 +443,7 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
           console.log(
             `[context-pruner] thread=${threadId} threshold crossed ` +
               `(pruned=${afterPruneTokens} ≥ ${summarizeThreshold}); ` +
+              `anchor=${hasMotion ? 'last-motion' : 'first-human (no motion this session)'}; ` +
               `summarizing head of ${headSlice.length + 1} messages…`
           );
           try {
@@ -462,7 +482,7 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
             // detection of a previous summary anywhere in this middleware —
             // folding is purely positional. On a later cycle this message sits
             // at firstHumanIdx + 1, inside the next headSlice
-            // (firstHumanIdx + 1 .. lastMotionAiIdx), so it is fed to the
+            // (firstHumanIdx + 1 .. boundaryIdx), so it is fed to the
             // summarizer and then discarded when the head is rebuilt around
             // the single new summary. The original first HumanMessage is
             // always preserved in place, so this summary can never become the
