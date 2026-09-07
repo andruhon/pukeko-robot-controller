@@ -639,6 +639,58 @@ describe('RC-53 the real world is ready when its camera is streaming', () => {
     }
   })
 
+  it('still captures the After frame when the motion outlasted the deadline', async () => {
+    // The cost of sharing one deadline, and the one place it could bite a real
+    // user. A long walk finishes AFTER the call's window has closed, so the
+    // After frame runs against an expired deadline — and must still get its
+    // frame, because by then the camera has been streaming the whole time. A
+    // wait that checked the deadline BEFORE attempting would fail this motion
+    // outright and report a camera fault for a camera that was working.
+    vi.useFakeTimers()
+    try {
+      const panel = makeStartingPanel()
+      panel.isActive = true // already streaming: the ordinary case
+      const calls: string[] = []
+      const slowFetch = vi.fn(async (input: RequestInfo | URL) => {
+        calls.push(String(input))
+        // Each leg of the walk outlasts the whole camera deadline on its own.
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        return { ok: true, status: 200, text: async () => 'ok' } as unknown as Response
+      })
+      const capabilities = createWorldCapabilities({
+        getWorldId: () => 'real',
+        hosts: HOSTS,
+        getWebcamPanel: () => panel,
+        fetch: slowFetch as unknown as typeof fetch,
+        cameraReadyPollMs: 1,
+        cameraReadyTimeoutMs: 100,
+      })
+      const session = createWorldSession({
+        worldId: 'real',
+        hosts: HOSTS,
+        presetId: ACEBOTT_QD021_PRESET.id,
+        capabilities,
+      })
+
+      const settled: string[] = []
+      void session.clientToolHandlers.move_forward({}).then((r) => {
+        settled.push(r)
+      })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      expect(settled).toHaveLength(1)
+      expect(JSON.parse(settled[0])).toEqual({
+        mimeType: 'image/jpeg',
+        data: 'COMPOSITEBYTES',
+        motion: 'move_forward',
+      })
+      expect(calls).toEqual(['http://10.0.0.7/forward', 'http://10.0.0.7/stop'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('honours the INJECTED deadline, so a shorter one really is shorter', async () => {
     // The override exists to make these specs fast, and nothing held it:
     // ignoring it and always using the production 5 s left every spec green,
