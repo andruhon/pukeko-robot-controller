@@ -495,9 +495,8 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
         // 1 pins the boundary at 1 forever: the guard reads `1 > 1`, nothing is
         // summarized on any round, and the only symptom is the ABSENCE of a log
         // line. Measured at the same profile over 60 rounds of move-once then
-        // talk — the frame arriving as the motion's own injected composite —
-        // 60679 estimated tokens against a 30000 cap, with the summarizer
-        // called zero times. The same missing condition is noisy
+        // talk: 60679 estimated tokens against a 30000 cap, with the
+        // summarizer called zero times. The same missing condition is noisy
         // rather than silent when the motion sits just above the guard — a
         // motion at index 2 leaves the boundary there, so every round summarizes
         // a one-message head and the tail behind it still grows: 60715 tokens
