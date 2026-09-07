@@ -1908,3 +1908,555 @@ describe('contextPrunerMiddleware — RC-27 a session with no motion call still 
     expect(await anchorLabelFor(withMotion)).toBe('last-motion')
   })
 })
+
+// ───────────────────────────────────────────────────────────────────────────
+// RC-56: a failed motion tool leaves no frame, and the motion anchor
+// summarizes the last one away.
+//
+// frontendImageInjectionMiddleware injects a Before/After composite only when
+// the tool result carries `mimeType` + `data`. On `payload.error` it injects a
+// TEXT-ONLY note instead, and on a result whose `data` is absent it injects
+// nothing at all. Either way the newest image-bearing turn is then OLDER than
+// the last motion AIMessage.
+//
+// RC-27's rule 1 gave the motion anchor unconditional precedence, so the
+// boundary sat at that motion message and the kept frame — the one the
+// mechanical strip had just elected to preserve on the very same pass — fell in
+// the head and was summarized away. The model was handed a motion failure to
+// recover from and no picture to recover with.
+//
+// The fix takes the EARLIER of the two anchors, under the same tail-fits
+// condition rule 2 already ships under. That condition is not defensive: RC-27
+// measured that an anchor free to sit arbitrarily early reintroduces unbounded
+// growth at 2x the token cap. Conditioning the min means it can only ever move
+// the boundary to a point whose tail is already proven under the threshold.
+//
+// Message classes are compared by reference or `getType()`, never `instanceof`
+// and never by prototype identity — this repo resolves two copies of
+// @langchain/core.
+// ───────────────────────────────────────────────────────────────────────────
+describe('contextPrunerMiddleware — RC-56 a failed motion keeps the frame the strip kept', () => {
+  const OVER_THRESHOLD = {
+    maxContextTokens: 1000,
+    summarizeAtFraction: 0.5,
+    imageTokenBudget: 50,
+  } as const
+
+  function captureResultJson(dataLen = 400): string {
+    return JSON.stringify({ mimeType: 'image/jpeg', data: 'X'.repeat(dataLen), captured: true })
+  }
+
+  function withoutRemoveMessages(result: unknown): BaseMessage[] {
+    return (result as { messages: BaseMessage[] }).messages.filter((m) => m.getType() !== 'remove')
+  }
+
+  function summaryMessages(messages: BaseMessage[]): HumanMessage[] {
+    return messages.filter(
+      (m): m is HumanMessage =>
+        isHumanMessage(m) && String(m.content).startsWith('[Context summary]')
+    )
+  }
+
+  function hasImage(m: BaseMessage): boolean {
+    return (
+      Array.isArray(m.content) &&
+      (m.content as { type?: string }[]).some(
+        (b) => b && (b.type === 'image' || b.type === 'image_url')
+      )
+    )
+  }
+
+  // Orphan safety as an invariant rather than an argument: every ToolMessage in
+  // the rebuilt array must still have the AIMessage that called it. Acceptance
+  // asks for this on EVERY branch, so it is a helper applied to each fixture
+  // rather than a claim made once about the shape of the code.
+  function orphanToolMessageIds(messages: BaseMessage[]): string[] {
+    const callIds = new Set<string>()
+    for (const m of messages) {
+      const tcs = (m as AIMessage).tool_calls
+      if (Array.isArray(tcs)) for (const tc of tcs) if (tc.id) callIds.add(tc.id)
+    }
+    return messages
+      .filter((m) => m.getType() === 'tool')
+      .filter((m) => {
+        const id = (m as ToolMessage).tool_call_id
+        return !id || !callIds.has(id)
+      })
+      .map((m) => String(m.id ?? '(no id)'))
+  }
+
+  // A motion session that has been producing frames normally. `cycles` complete
+  // motion turns, each ending in the injected Before/After composite.
+  function motionCycles(cycles: number): BaseMessage[] {
+    const out: BaseMessage[] = []
+    for (let i = 0; i < cycles; i++) {
+      out.push(
+        new AIMessage({
+          id: `ai-motion-${i}`,
+          content: '',
+          tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: `tc-mv-${i}` }],
+        })
+      )
+      out.push(
+        new ToolMessage({
+          id: `tm-motion-${i}`,
+          content: motionResultJson('move_forward (steps=2)', 400),
+          tool_call_id: `tc-mv-${i}`,
+          name: 'move_forward',
+        })
+      )
+      out.push(
+        new HumanMessage({
+          id: `h-frame-${i}`,
+          content: [{ type: 'text', text: 'Before/After frames.' }, imageBlock()],
+        })
+      )
+      out.push(new AIMessage({ id: `ai-narrate-${i}`, content: 'N'.repeat(400) }))
+    }
+    return out
+  }
+
+  // …and then the newest motion FAILS. This is what the real pipeline leaves
+  // behind: the AIMessage, an error-status ToolMessage carrying no image, and
+  // the text-only note frontendImageInjectionMiddleware pushes on `error`.
+  function failedMotionHistory(cycles = 5): {
+    user: HumanMessage
+    frame: HumanMessage
+    messages: BaseMessage[]
+  } {
+    const user = new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' })
+    const cyclesMsgs = motionCycles(cycles)
+    const messages: BaseMessage[] = [
+      user,
+      ...cyclesMsgs,
+      new AIMessage({
+        id: 'ai-motion-failed',
+        content: '',
+        tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'tc-failed' }],
+      }),
+      new ToolMessage({
+        id: 'tm-motion-failed',
+        content: JSON.stringify({ error: 'robot unreachable' }),
+        tool_call_id: 'tc-failed',
+        name: 'move_forward',
+        status: 'error',
+      }),
+      new HumanMessage({
+        id: 'h-fail-note',
+        content: 'Motion (move_forward) failed: robot unreachable',
+      }),
+    ]
+    const frame = messages.find((m) => m.id === `h-frame-${cycles - 1}`) as HumanMessage
+    return { user, frame, messages }
+  }
+
+  it('THE DEFECT: a failed newest motion still delivers the kept frame to the recovery call', async () => {
+    // Red on RC-27's code: the boundary sits unconditionally at
+    // `ai-motion-failed`, so `h-frame-4` — which the mechanical strip kept on
+    // this very pass — lands in the head and is summarized away. The model is
+    // asked to recover from a motion failure with no picture at all.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const { user, frame, messages } = failedMotionHistory()
+    // The premise: the newest image-bearing turn really is older than the last
+    // motion call. Without this the fixture would not exercise the branch.
+    const frameIdx = messages.indexOf(frame)
+    const motionIdx = messages.findIndex((m) => m.id === 'ai-motion-failed')
+    expect(frameIdx).toBeGreaterThan(-1)
+    expect(frameIdx).toBeLessThan(motionIdx)
+    expect(hasImage(frame)).toBe(true)
+
+    const result = await before({ messages }, runtime)
+
+    // It did summarize — this is not the under-threshold path passing by
+    // accident.
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    const rebuilt = withoutRemoveMessages(result)
+    expect(summaryMessages(rebuilt)).toHaveLength(1)
+
+    // THE ASSERTION: the frame survives, as the same object, still carrying its
+    // image block.
+    const kept = rebuilt.find((m) => m.id === frame.id)
+    expect(kept).toBe(frame)
+    expect(hasImage(kept as BaseMessage)).toBe(true)
+    expect(rebuilt.filter(hasImage).map((m) => m.id)).toEqual(['h-frame-4'])
+
+    // The failed motion turn is still in the tail — the recovery call needs the
+    // failure as well as the picture.
+    expect(rebuilt.map((m) => m.id)).toEqual([
+      'h-user',
+      undefined,
+      'h-frame-4',
+      'ai-narrate-4',
+      'ai-motion-failed',
+      'tm-motion-failed',
+      'h-fail-note',
+    ])
+    expect(rebuilt[0]).toBe(user)
+    // The error status rides through, so the model can tell a failed motion
+    // from a completed one.
+    expect((rebuilt.find((m) => m.id === 'tm-motion-failed') as ToolMessage).status).toBe('error')
+    expect(orphanToolMessageIds(rebuilt)).toEqual([])
+  })
+
+  it('the same holds for a motion result whose image data never arrived', async () => {
+    // The second route to "newest frame older than the last motion", and it is
+    // not an error case: frontendImageInjectionMiddleware injects nothing at all
+    // when a motion result arrives without its base64 `data`, deliberately
+    // leaving the guard clean (RC-21). No error note either, so the tail here is
+    // shorter than the failed-motion one — a fixture that would pass on a fix
+    // keyed to `status === 'error'` and must not.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const user = new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' })
+    const messages: BaseMessage[] = [
+      user,
+      ...motionCycles(5),
+      new AIMessage({
+        id: 'ai-motion-last',
+        content: '',
+        tool_calls: [{ name: 'turn_left', args: { steps: 1 }, id: 'tc-last' }],
+      }),
+      new ToolMessage({
+        id: 'tm-motion-last',
+        content: JSON.stringify({ mimeType: 'image/jpeg', motion: 'turn_left (steps=1)' }),
+        tool_call_id: 'tc-last',
+        name: 'turn_left',
+      }),
+    ]
+
+    const result = await before({ messages }, runtime)
+
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    const rebuilt = withoutRemoveMessages(result)
+    expect(rebuilt.map((m) => m.id)).toEqual([
+      'h-user',
+      undefined,
+      'h-frame-4',
+      'ai-narrate-4',
+      'ai-motion-last',
+      'tm-motion-last',
+    ])
+    expect(rebuilt.filter(hasImage).map((m) => m.id)).toEqual(['h-frame-4'])
+    expect(orphanToolMessageIds(rebuilt)).toEqual([])
+  })
+
+  it('UNCHANGED: a successful newest motion is byte-identical at the shipped keepLatestImages=1', async () => {
+    // The successful path is where the injected composite sits AFTER the motion
+    // message, so the earlier of the two anchors IS the motion message and the
+    // min is a no-op. Pinned field by field — ids, object identity, image
+    // blocks, tool-call pairing and what the summarizer was given.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const user = new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' })
+    const cycles = motionCycles(6)
+    const messages: BaseMessage[] = [user, ...cycles]
+
+    const result = await before({ messages }, runtime)
+
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    const rebuilt = withoutRemoveMessages(result)
+    expect(rebuilt.map((m) => m.id)).toEqual([
+      'h-user',
+      undefined,
+      'ai-motion-5',
+      'tm-motion-5',
+      'h-frame-5',
+      'ai-narrate-5',
+    ])
+    // Object identity, not just ids: the tail is the original messages, except
+    // the motion ToolMessage, which the mechanical strip copies to drop its
+    // base64 frame.
+    expect(rebuilt[0]).toBe(user)
+    expect(rebuilt[2]).toBe(messages.find((m) => m.id === 'ai-motion-5'))
+    expect(rebuilt[4]).toBe(messages.find((m) => m.id === 'h-frame-5'))
+    expect(rebuilt[5]).toBe(messages.find((m) => m.id === 'ai-narrate-5'))
+    expect(JSON.parse(rebuilt[3].content as string)).toEqual({
+      mimeType: 'image/jpeg',
+      motion: 'move_forward (steps=2)',
+      dataDropped: true,
+    })
+    expect(rebuilt.filter(hasImage).map((m) => m.id)).toEqual(['h-frame-5'])
+    expect(orphanToolMessageIds(rebuilt)).toEqual([])
+    // And the summarizer was given exactly the head, up to but excluding the
+    // anchor.
+    const sentIds = (llm.invoke.mock.calls[0][0] as BaseMessage[]).map((m) => m.id)
+    expect(sentIds).toContain('ai-motion-4')
+    expect(sentIds).toContain('h-frame-4')
+    expect(sentIds).not.toContain('ai-motion-5')
+  })
+
+  it('keepLatestImages=2 on a SUCCESSFUL motion session now holds back both kept frames', async () => {
+    // A deliberate, measured behaviour change, disclosed rather than hidden.
+    // At the shipped N=1 the oldest kept frame is the newest one and always
+    // sits after the last motion, so the min never fires. At N>=2 the OLDER of
+    // the two kept frames sits before the last motion, and RC-27's code
+    // summarized it away — the strip kept a frame and the summarizer discarded
+    // it, on a perfectly healthy session. That is the same contradiction RC-27
+    // named in its own rule 2 ("the summarizer must not discard what the strip
+    // just elected to keep"), one frame in; making the anchor the earlier of the
+    // two resolves it consistently rather than only on the motion-free path.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({
+      llm,
+      ...OVER_THRESHOLD,
+      keepLatestImages: 2,
+    }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const messages: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' }),
+      ...motionCycles(6),
+    ]
+
+    const result = await before({ messages }, runtime)
+
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    const rebuilt = withoutRemoveMessages(result)
+    // Both frames the strip kept are still here, with their images.
+    expect(rebuilt.filter(hasImage).map((m) => m.id)).toEqual(['h-frame-4', 'h-frame-5'])
+    expect(rebuilt.map((m) => m.id)).toEqual([
+      'h-user',
+      undefined,
+      'h-frame-4',
+      'ai-narrate-4',
+      'ai-motion-5',
+      'tm-motion-5',
+      'h-frame-5',
+      'ai-narrate-5',
+    ])
+    expect(orphanToolMessageIds(rebuilt)).toEqual([])
+  })
+
+  it('the min gives way when the kept frame is early: an old frame does not drag the boundary back', async () => {
+    // The boundedness condition, seen in one call. A frame near the START of a
+    // long history has a tail that is itself over the threshold, so anchoring
+    // there would compress nothing. The boundary falls back to the last motion
+    // message — RC-27's rule 1 — and the frame is spent. This is the case where
+    // no bounded boundary could have kept it.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const user = new HumanMessage({ id: 'h-user', content: 'Look once, then drive.' })
+    const messages: BaseMessage[] = [
+      user,
+      new AIMessage({
+        id: 'ai-capture-0',
+        content: '',
+        tool_calls: [{ name: 'capture_image', args: {}, id: 'tc-cap-0' }],
+      }),
+      new ToolMessage({
+        id: 'tm-cap-0',
+        content: captureResultJson(),
+        tool_call_id: 'tc-cap-0',
+        name: 'capture_image',
+      }),
+      new HumanMessage({
+        id: 'h-frame-0',
+        content: [{ type: 'text', text: 'Frame 0.' }, imageBlock()],
+      }),
+    ]
+    for (let i = 0; i < 12; i++) {
+      messages.push(new AIMessage({ id: `ai-answer-${i}`, content: 'A'.repeat(400) }))
+    }
+    messages.push(
+      new AIMessage({
+        id: 'ai-motion-failed',
+        content: '',
+        tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'tc-failed' }],
+      }),
+      new ToolMessage({
+        id: 'tm-motion-failed',
+        content: JSON.stringify({ error: 'robot unreachable' }),
+        tool_call_id: 'tc-failed',
+        name: 'move_forward',
+        status: 'error',
+      })
+    )
+
+    const result = await before({ messages }, runtime)
+
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    const rebuilt = withoutRemoveMessages(result)
+    expect(rebuilt.map((m) => m.id)).toEqual([
+      'h-user',
+      undefined,
+      'ai-motion-failed',
+      'tm-motion-failed',
+    ])
+    expect(rebuilt.filter(hasImage)).toHaveLength(0)
+    expect(orphanToolMessageIds(rebuilt)).toEqual([])
+  })
+
+  it('the log names the fourth rule when the kept frame precedes the last motion', async () => {
+    // `anchor=` is the only thing that says from a live log which policy is in
+    // force. With the min there are four outcomes, not three, and the existing
+    // three-label test cannot see the new one: its rule-1 fixture puts the frame
+    // AFTER the motion, so it takes the same branch it always did.
+    async function anchorLabelFor(messages: BaseMessage[], opts = {}): Promise<string> {
+      const llm = makeStubLlm()
+      const mw = createContextPrunerMiddleware({
+        llm,
+        ...OVER_THRESHOLD,
+        ...opts,
+      }) as HookContainer
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      try {
+        await getHook(mw.beforeModel)({ messages }, runtime)
+        const line = spy.mock.calls.map((c) => String(c[0])).find((l) => l.includes('anchor='))
+        return line ? (line.match(/anchor=([^;]*)/)?.[1] ?? '') : ''
+      } finally {
+        spy.mockRestore()
+      }
+    }
+
+    // The new branch: motion present, but the kept frame is older than it.
+    expect(await anchorLabelFor(failedMotionHistory().messages)).toBe(
+      'kept-frame-before-last-motion'
+    )
+    // Still rule 1 when the frame sits after the motion — the successful path.
+    expect(
+      await anchorLabelFor([
+        new HumanMessage({ id: 'h-user', content: 'Drive on.' }),
+        ...motionCycles(6),
+      ])
+    ).toBe('last-motion')
+  })
+
+  // The session property, at the SHIPPED production profile rather than the
+  // scaled-down one the rest of this block uses, because the number that
+  // matters is the one the robot actually runs against. Written as loops over
+  // the real rewrite, fed back, exactly as RC-27's boundedness test is: the
+  // failure mode being guarded is a feedback effect, which a single-call
+  // boundary assertion cannot see.
+  const PRUNER_LOCAL = {
+    maxContextTokens: 30_000,
+    summarizeAtFraction: 0.7,
+    keepLatestImages: 1,
+    imageTokenBudget: 800,
+  } as const
+
+  // One round of a driving session. `motionFails` decides whether the tool
+  // result carries a frame (and therefore whether a composite is injected),
+  // which is the whole variable this node turns on.
+  function driveRound(round: number, motionFails: boolean): BaseMessage[] {
+    const out: BaseMessage[] = [
+      new AIMessage({ id: `ai-think-${round}`, content: 'A'.repeat(4000) }),
+      new AIMessage({
+        id: `ai-motion-${round}`,
+        content: '',
+        tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: `tc-mv-${round}` }],
+      }),
+    ]
+    if (motionFails) {
+      out.push(
+        new ToolMessage({
+          id: `tm-motion-${round}`,
+          content: JSON.stringify({ error: 'robot unreachable' }),
+          tool_call_id: `tc-mv-${round}`,
+          name: 'move_forward',
+          status: 'error',
+        }),
+        // Text-only: what frontendImageInjectionMiddleware pushes on `error`.
+        new HumanMessage({
+          id: `h-fail-note-${round}`,
+          content: 'Motion (move_forward) failed: robot unreachable',
+        })
+      )
+    } else {
+      out.push(
+        new ToolMessage({
+          id: `tm-motion-${round}`,
+          content: motionResultJson('move_forward (steps=2)', 400),
+          tool_call_id: `tc-mv-${round}`,
+          name: 'move_forward',
+        }),
+        new HumanMessage({
+          id: `h-frame-${round}`,
+          content: [{ type: 'text', text: 'Before/After frames.' }, imageBlock()],
+        })
+      )
+    }
+    return out
+  }
+
+  async function runSession(
+    fails: (round: number) => boolean,
+    rounds = 60
+  ): Promise<{ peak: number; summaries: number; framesHeld: number }> {
+    const invoke = vi.fn(async () => ({ content: SUMMARY_TEXT }))
+    const llm = { invoke } as unknown as Parameters<typeof createContextPrunerMiddleware>[0]['llm']
+    const mw = createContextPrunerMiddleware({ llm, ...PRUNER_LOCAL }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    let state: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' }),
+    ]
+    let peak = 0
+    let framesHeld = 0
+    for (let round = 0; round < rounds; round++) {
+      const result = await before({ messages: state }, runtime)
+      const body = result ? withoutRemoveMessages(result) : state
+      peak = Math.max(peak, estimateTokens(body, PRUNER_LOCAL.imageTokenBudget))
+      if (body.some(hasImage)) framesHeld++
+      // Orphan safety is a per-round invariant, not a property of one fixture.
+      expect(orphanToolMessageIds(body)).toEqual([])
+      state = [...body, ...driveRound(round, fails(round))]
+    }
+    return { peak, summaries: invoke.mock.calls.length, framesHeld }
+  }
+
+  it('BOUNDEDNESS: a driving session with intermittent motion failures stays under the hard cap', async () => {
+    // The shape this node is FOR: the robot is driving and producing frames,
+    // and every third motion fails. On RC-27's code the boundary sat on the
+    // failed motion and the frame from the previous turn was summarized away.
+    const ROUNDS = 60
+    const { peak, summaries, framesHeld } = await runSession((r) => r % 3 === 2, ROUNDS)
+
+    // Never over the configured hard cap…
+    expect(peak).toBeLessThan(PRUNER_LOCAL.maxContextTokens)
+    // …and not achieved by summarizing on every turn, which is what an anchor
+    // that never makes progress looks like from the outside.
+    expect(summaries).toBeLessThan(ROUNDS / 2)
+    expect(summaries).toBeGreaterThan(0)
+    // The point of the change: the frame is genuinely carried through the
+    // session rather than merely bounded away.
+    expect(framesHeld).toBeGreaterThan(ROUNDS * 0.9)
+  })
+
+  it('BOUNDEDNESS: a session whose motions ALWAYS fail is bounded, with no frame to keep', async () => {
+    // The degenerate end of the range. Every motion fails, so no composite is
+    // ever injected and this session never holds a frame at all — there is
+    // nothing for the frame anchor to protect, and the boundary is the last
+    // motion turn on every round, exactly as on RC-27's code. Bounded is the
+    // only property available here, and it is the one asserted; framesHeld is
+    // pinned at 0 so a future change that started injecting frames on the error
+    // path would show up here rather than silently altering what this test
+    // covers.
+    const ROUNDS = 60
+    const { peak, summaries, framesHeld } = await runSession(() => true, ROUNDS)
+
+    expect(peak).toBeLessThan(PRUNER_LOCAL.maxContextTokens)
+    expect(summaries).toBeLessThan(ROUNDS / 2)
+    expect(summaries).toBeGreaterThan(0)
+    expect(framesHeld).toBe(0)
+  })
+
+  it('BOUNDEDNESS: an all-successful driving session is unchanged and bounded', async () => {
+    // The control for the two above: the path this node must not disturb.
+    const ROUNDS = 60
+    const { peak, summaries, framesHeld } = await runSession(() => false, ROUNDS)
+
+    expect(peak).toBeLessThan(PRUNER_LOCAL.maxContextTokens)
+    expect(summaries).toBeLessThan(ROUNDS / 2)
+    expect(summaries).toBeGreaterThan(0)
+    expect(framesHeld).toBeGreaterThan(ROUNDS * 0.9)
+  })
+})

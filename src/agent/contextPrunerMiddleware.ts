@@ -435,38 +435,58 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
         // a real one — capture and narrate, question answering, any read-only
         // interaction — not a degenerate history.
         //
-        // 1. With a motion call, the boundary is that call: the motion
-        //    AIMessage, its ToolMessage and the injected Before/After composite
-        //    (plus anything newer) are held back from the summarizer.
+        // TWO things can need protecting, and they are independent:
         //
-        // 2. With no motion call, the state the next call depends on is the
-        //    camera frame. `keepLatestImages` deliberately carries the newest
-        //    image-bearing turn through the mechanical strip, so the summarizer
-        //    must not then discard what the strip just elected to keep — two
-        //    policies in one middleware contradicting each other is how a
-        //    capture-and-narrate session reached its narrating call holding a
-        //    text recap and no picture. The anchor is therefore the OLDEST
-        //    image-bearing turn the strip kept (the newest one at the shipped
-        //    `keepLatestImages: 1`), taken from the strip's own answer rather
-        //    than recomputed here, so the two can never disagree.
+        // 1. The most recent motion turn: the motion AIMessage, its ToolMessage
+        //    and the injected Before/After composite (plus anything newer).
         //
-        // 3. Otherwise the boundary is the end of the history: with no frame
-        //    and no motion there is genuinely nothing to hold back.
+        // 2. The camera frame. `keepLatestImages` deliberately carries the
+        //    newest image-bearing turn(s) through the mechanical strip, so the
+        //    summarizer must not then discard what the strip just elected to
+        //    keep — two policies in one middleware contradicting each other is
+        //    how a capture-and-narrate session reached its narrating call
+        //    holding a text recap and no picture. The frame anchor is the
+        //    OLDEST image-bearing turn the strip kept (the newest one at the
+        //    shipped `keepLatestImages: 1`), taken from the strip's own answer
+        //    rather than recomputed here, so the two can never disagree.
         //
-        // Rule 2 applies only while the tail it creates still fits under the
-        // summarize threshold, and that condition is load-bearing rather than
-        // defensive. Holding back everything from the frame onwards is cheap
-        // when the frame is recent — one image block, the same budget the strip
-        // already spends — but a session that captures once and then talks puts
-        // the frame near the START, and anchoring there hands the summarizer a
-        // two-message head while the uncompressed tail keeps growing. Measured
-        // at the shipped local profile, that shape crossed the 30000-token hard
-        // cap at round 58 and reached 62021 tokens while firing the summarizer
-        // on 80 of 120 turns: RC-27's own unbounded-growth defect, reintroduced
-        // by the anchor meant to fix a different one. Falling through to rule 3
-        // there is what keeps the summarize step making real progress, and it
-        // costs the frame only in the shape where no bounded boundary could
-        // have kept it.
+        // The boundary is the EARLIER of the two, so neither anchor summarizes
+        // away what the other exists to protect. Giving the motion anchor
+        // unconditional precedence looks harmless — the injected composite
+        // normally lands one message AFTER the motion, so the motion IS the
+        // earlier of the two and the choice never arises. It stops being
+        // harmless exactly when the frame is missing from the newest motion
+        // turn, which is not an edge case:
+        //   - the motion tool ERRORED, so frontendImageInjectionMiddleware
+        //     pushed a text-only failure note and no image;
+        //   - or its result arrived without base64 `data`, so that middleware
+        //     deliberately injected nothing at all.
+        // In both, the newest kept frame is OLDER than the motion message, a
+        // motion-wins boundary summarizes it away, and the model is handed a
+        // motion failure to recover from with no picture to recover with. The
+        // same contradiction appears one frame in on a perfectly healthy
+        // session at `keepLatestImages >= 2`, where the older of the two kept
+        // frames sits before the last motion.
+        //
+        // 3. With neither a motion call nor a kept frame the boundary is the
+        //    end of the history: there is genuinely nothing to hold back.
+        //
+        // The frame anchor applies only while the tail it creates still fits
+        // under the summarize threshold, and that condition is load-bearing
+        // rather than defensive — it is what keeps "earlier of the two" from
+        // being an anchor that can sit arbitrarily early. Holding back
+        // everything from the frame onwards is cheap when the frame is recent —
+        // one image block, the same budget the strip already spends — but a
+        // session that captures once and then talks puts the frame near the
+        // START, and anchoring there hands the summarizer a two-message head
+        // while the uncompressed tail keeps growing. Measured at the shipped
+        // local profile, that shape crossed the 30000-token hard cap at round
+        // 58 and reached 62021 tokens while firing the summarizer on 80 of 120
+        // turns: RC-27's own unbounded-growth defect, reintroduced by the anchor
+        // meant to fix a different one. When the condition fails the frame
+        // anchor drops out and the boundary is the motion turn, or the end of
+        // the history — which costs the frame only in the shape where no
+        // bounded boundary could have kept it.
         //
         // Be precise about WHAT is bounded, because it is not the whole
         // rebuild: the condition is checked on the tail alone. The rebuild is
@@ -482,11 +502,14 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
         // the prefix into the condition is a one-expression change if that ever
         // stops being true.
         //
-        // Orphan safety, in all three cases: a tool call is never summarized
-        // away from its result. The injected image HumanMessage always sits
-        // AFTER the ToolMessage it was built from, so cutting at it leaves the
-        // AIMessage(tool_calls)/ToolMessage pair together in the head; a cut at
-        // the end takes the whole tail or none of it.
+        // Orphan safety, on every branch: a tool call is never summarized away
+        // from its result. The injected image HumanMessage always sits AFTER
+        // the ToolMessage it was built from, so cutting at it leaves the
+        // AIMessage(tool_calls)/ToolMessage pair together in the head; cutting
+        // at a motion AIMessage takes that message and its result together into
+        // the tail; and a cut at the end takes the whole tail or none of it.
+        // Moving the cut EARLIER, to a frame that precedes the last motion,
+        // keeps every pair after it whole for the same reason.
         const hasMotion = lastMotionAiIdx >= 0;
         const oldestKeptImageIdx =
           keptImageIdx.length > 0 ? keptImageIdx[keptImageIdx.length - 1] : -1;
@@ -496,18 +519,27 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
             : 0;
         const keptFrameTailFits =
           oldestKeptImageIdx >= 0 && keptFrameTailTokens < summarizeThreshold;
-        const boundaryIdx = hasMotion
-          ? lastMotionAiIdx
-          : keptFrameTailFits
-            ? oldestKeptImageIdx
-            : pruned.length;
-        // Names which of the three rules chose the boundary. Pinned by test:
-        // with three branches the label is the only thing that says, from a log
-        // alone, which policy is in force on a live run.
-        const anchorLabel = hasMotion
-          ? 'last-motion'
-          : keptFrameTailFits
-            ? 'oldest-kept-frame'
+        // The boundary with no frame in play: the last motion turn, else the
+        // end of the history.
+        const motionOrEndIdx = hasMotion ? lastMotionAiIdx : pruned.length;
+        // The frame anchor only ever pulls the boundary EARLIER, and only from
+        // a position whose tail is already proven under the threshold — so it
+        // cannot widen the tail past what rule 3's condition already allows.
+        const anchoredOnKeptFrame = keptFrameTailFits && oldestKeptImageIdx < motionOrEndIdx;
+        const boundaryIdx = keptFrameTailFits
+          ? Math.min(motionOrEndIdx, oldestKeptImageIdx)
+          : motionOrEndIdx;
+        // Names which rule chose the boundary. Pinned by test: the label is the
+        // only thing that says, from a log alone, which policy is in force on a
+        // live run — and the motion cases now split in two, so a log reading
+        // `last-motion` on a run that actually anchored on the frame would
+        // misreport precisely the branch this node added.
+        const anchorLabel = anchoredOnKeptFrame
+          ? hasMotion
+            ? 'kept-frame-before-last-motion'
+            : 'oldest-kept-frame'
+          : hasMotion
+            ? 'last-motion'
             : 'end-of-history (no frame worth holding back)';
 
         if (firstHumanIdx >= 0 && boundaryIdx > firstHumanIdx + 1) {
