@@ -15,9 +15,18 @@ import type { RobotToolDef, RecipeStep, HttpPath } from './../agent/robotPresets
 // backed by the mounted <PkWebcamPanel> ref and the real `fetch`; tests supply
 // fakes. `robotUrl` + `robotHost` are added by RobotSession from its config.
 export interface RobotCapabilities {
-  // Whether the webcam panel is mounted/usable yet. Guards the pre-motion
-  // "Webcam not initialized" case exactly as the old runMotion did.
+  // Whether frames can be captured RIGHT NOW. Guards the pre-motion "Webcam not
+  // initialized" case exactly as the old runMotion did. RC-53: for the real
+  // world this means the media stream is flowing, not merely that the panel is
+  // mounted — see worlds.ts, which is where the definition is stated.
   isReady(): boolean;
+  // RC-53: resolve once `isReady()` holds, or once a bounded deadline passes.
+  // Optional because the interpreter's contract is "ask, then act" and a
+  // capability set with no startup window (every test fake, the HTTP snapshot
+  // source) has nothing to wait for. RobotSession awaits it before either gate
+  // so a tool call arriving during the camera's startup waits for the stream
+  // instead of being refused for not having one yet.
+  whenReady?(): Promise<void>;
   // May be synchronous (the mounted <PkWebcamPanel>, which draws off a canvas
   // it already has) or asynchronous (an HTTP-backed source, which must fetch
   // the frame). This mirrors vue-ui's own ImageCaptureSource, which allows

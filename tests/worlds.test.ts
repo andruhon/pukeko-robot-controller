@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
+import { defineComponent, h, nextTick, ref } from 'vue'
 import { mount } from '@vue/test-utils'
+import { PkWebcamPanel } from '@galvanized-pukeko/vue-ui'
 import {
   captureUrlForWorld,
   createWorldCapabilities,
@@ -55,12 +57,21 @@ function makeFetch(opts?: { captureStatus?: number }) {
   return { fn: fn as unknown as typeof fetch, calls }
 }
 
-/** A stand-in for the mounted <PkWebcamPanel>. */
+/**
+ * A stand-in for the mounted <PkWebcamPanel>, streaming.
+ *
+ * RC-53 added `isActive` to model the panel's real exposed surface: the panel
+ * has always had it, and the capabilities have to read it now that readiness
+ * means the stream is flowing rather than that the component exists. `true`
+ * here is the settled state these RC-44 specs were always describing — the
+ * starting-up state they never exercised is covered on its own below.
+ */
 function makePanel() {
   const composeBeforeAfter = vi.fn(
     async (_b: string, _a: string) => 'data:image/jpeg;base64,COMPOSITEBYTES'
   )
   return {
+    isActive: true,
     captureFrame: vi.fn(() => 'data:image/png;base64,LIVEWEBCAMFRAME'),
     composeBeforeAfter,
   }
@@ -291,6 +302,196 @@ describe('RC-44 selecting a world repoints the CAPTURE source', () => {
       'data:image/jpeg;base64,SIMAFTER'
     )
     expect(composite).toBe('data:image/jpeg;base64,COMPOSITEBYTES')
+  })
+})
+
+// --- RC-53: readiness means the stream is flowing --------------------------
+
+describe('RC-53 the real world is ready when its camera is streaming', () => {
+  // The defect this pins: selecting the real world MOUNTS the panel at once,
+  // but getUserMedia resolves later and the <video> decodes its first frame
+  // later still. Readiness used to be satisfied by the mount, so a capture
+  // issued in between was answered "Is the camera active?" about a camera that
+  // was in the act of becoming active. Measured at a 23 ms margin in the
+  // browser e2e — which is why the pin belongs here, at a level where the
+  // timing is controlled, rather than in a browser run that has to lose a race
+  // to notice.
+  //
+  // Every frame literal below is written out by hand rather than read back off
+  // the panel fake, so a capture path that stops producing frames cannot
+  // satisfy these by agreeing with itself.
+  const LIVE_FRAME = 'data:image/png;base64,LIVEWEBCAMFRAME'
+
+  /**
+   * A panel that starts NOT streaming, exactly as a freshly mounted one does.
+   *
+   * `goLive()` is called by the test on a timer, so the transition happens
+   * while a capture is already in flight — the actual shape of the race. Before
+   * it, `captureFrame` returns what a real panel returns with a zero-size
+   * <video>: the string a 0x0 canvas serialises to. It is truthy, it is not an
+   * image, and accepting it is the failure mode one frame further on.
+   */
+  function makeStartingPanel(opts: { blankFramesWhenLive?: number } = {}) {
+    let blanksLeft = opts.blankFramesWhenLive ?? 0
+    const panel = {
+      isActive: false,
+      captureFrame: vi.fn(() => {
+        if (!panel.isActive) return 'data:,'
+        if (blanksLeft > 0) {
+          blanksLeft--
+          return 'data:,'
+        }
+        return LIVE_FRAME
+      }),
+      composeBeforeAfter: vi.fn(
+        async (_b: string, _a: string) => 'data:image/jpeg;base64,COMPOSITEBYTES'
+      ),
+    }
+    return panel
+  }
+
+  function realWorldCapabilities(
+    panel: ReturnType<typeof makeStartingPanel>,
+    overrides?: { cameraReadyTimeoutMs?: number }
+  ) {
+    const { fn } = makeFetch()
+    return createWorldCapabilities({
+      getWorldId: () => 'real',
+      hosts: HOSTS,
+      getWebcamPanel: () => panel,
+      fetch: fn,
+      cameraReadyPollMs: 1,
+      ...overrides,
+    })
+  }
+
+  it('is NOT ready while the panel is mounted but its stream has not started', () => {
+    const panel = makeStartingPanel()
+    const capabilities = realWorldCapabilities(panel)
+
+    // The whole defect in one assertion: mounted, and not ready. Before RC-53
+    // this returned true, which is what let a capture through into the gap.
+    expect(capabilities.isReady()).toBe(false)
+
+    panel.isActive = true
+    expect(capabilities.isReady()).toBe(true)
+  })
+
+  it('answers a capture issued before the camera is live with a FRAME, not an error', async () => {
+    const panel = makeStartingPanel()
+    const capabilities = realWorldCapabilities(panel)
+    const session = createWorldSession({
+      worldId: 'real',
+      hosts: HOSTS,
+      presetId: ACEBOTT_QD021_PRESET.id,
+      capabilities,
+    })
+
+    // The stream comes up while the capture is already waiting — the ordering
+    // the e2e hit by 23 ms.
+    const live = setTimeout(() => {
+      panel.isActive = true
+    }, 20)
+
+    const result = JSON.parse(await session.captureImage())
+    clearTimeout(live)
+
+    // Not 'Webcam not initialized', and not 'Failed to capture frame. Is the
+    // camera active?' — an actual image envelope.
+    expect(result).toEqual({ mimeType: 'image/png', data: 'LIVEWEBCAMFRAME' })
+  })
+
+  it('keeps waiting when the stream is live but the video has not decoded a frame yet', async () => {
+    // isActive flips as soon as getUserMedia resolves, which is BEFORE the
+    // <video> reports a size. Drawing then yields 'data:,' from a 0x0 canvas.
+    // A readiness signal that stopped at isActive would hand that on and
+    // reproduce the same user-visible failure, one frame later.
+    const panel = makeStartingPanel({ blankFramesWhenLive: 3 })
+    const capabilities = realWorldCapabilities(panel)
+    panel.isActive = true
+
+    expect(await capabilities.captureFrame()).toBe(LIVE_FRAME)
+    // Three blanks refused, then the real frame: the wait outlasted them.
+    expect(panel.captureFrame).toHaveBeenCalledTimes(4)
+  })
+
+  it('gives up at the deadline and blames the camera, rather than waiting forever', async () => {
+    // A camera that is denied, absent, or held by another application never
+    // goes live. The wait is bounded, so this is still an answer — and by the
+    // time it is given, "the camera had not started yet" is no longer the
+    // reason: it was given 50 ms and never started at all.
+    const panel = makeStartingPanel()
+    const capabilities = realWorldCapabilities(panel, { cameraReadyTimeoutMs: 50 })
+    const session = createWorldSession({
+      worldId: 'real',
+      hosts: HOSTS,
+      presetId: ACEBOTT_QD021_PRESET.id,
+      capabilities,
+    })
+
+    const result = JSON.parse(await session.captureImage())
+
+    expect(result).toEqual({ error: 'Webcam not initialized' })
+    expect(panel.isActive).toBe(false)
+  })
+
+  it('reads isActive off the REAL panel as a boolean, through the ref App.vue holds', async () => {
+    // The one way this fix can degrade silently. `isActive` is a `ref()` inside
+    // <PkWebcamPanel>, and the package's own .d.ts types the exposed member as
+    // `Ref<boolean, boolean>`. If it arrived here as the ref OBJECT rather than
+    // its value it would be truthy always, `isReady()` would go back to meaning
+    // "mounted", and every test above would still pass because they hand in a
+    // plain boolean. Nothing else in the suite — and no browser run — would
+    // notice.
+    //
+    // So this mounts the real published component behind a real template ref,
+    // which is precisely what App.vue's `webcamPanelRef` is, and asserts the
+    // unwrapping actually happens. jsdom has no `navigator.mediaDevices`, so
+    // the panel's startCamera fails and leaves the stream down: a false that
+    // has to be a real boolean false, not an object.
+    const panelRef = ref<InstanceType<typeof PkWebcamPanel> | null>(null)
+    const Parent = defineComponent({
+      setup: () => () => h(PkWebcamPanel, { ref: panelRef }),
+    })
+    const wrapper = mount(Parent)
+    await nextTick()
+
+    expect(panelRef.value).not.toBeNull()
+    expect(typeof panelRef.value!.isActive).toBe('boolean')
+    expect(panelRef.value!.isActive).toBe(false)
+
+    // ...and the capabilities read that same value, so an unmounted camera is
+    // reported not-ready rather than ready-because-truthy.
+    const { fn } = makeFetch()
+    const capabilities = createWorldCapabilities({
+      getWorldId: () => 'real',
+      hosts: HOSTS,
+      getWebcamPanel: () => panelRef.value,
+      fetch: fn,
+    })
+    expect(capabilities.isReady()).toBe(false)
+
+    wrapper.unmount()
+  })
+
+  it('does not make the simulated world wait on a camera it never uses', async () => {
+    // The simulated world reads frames over HTTP and stops the camera stream
+    // outright, so a panel with isActive false is entirely normal there and
+    // must not gate anything.
+    const panel = makeStartingPanel()
+    const { fn, calls } = makeFetch()
+    const capabilities = createWorldCapabilities({
+      getWorldId: () => 'simulated',
+      hosts: HOSTS,
+      getWebcamPanel: () => panel,
+      fetch: fn,
+      cameraReadyPollMs: 1,
+      cameraReadyTimeoutMs: 50,
+    })
+
+    expect(capabilities.isReady()).toBe(true)
+    expect(await capabilities.captureFrame()).toBe(FRAME_DATA_URL)
+    expect(calls).toEqual(['http://127.0.0.1:9099/capture'])
   })
 })
 

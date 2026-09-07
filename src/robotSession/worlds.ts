@@ -13,6 +13,7 @@
 // extracted (RC-7). App.vue supplies the reactive getters and the real fetch.
 import {
   createHttpSnapshotCaptureSource,
+  frameToEnvelope,
   type ImageCaptureSource,
 } from '@galvanized-pukeko/vue-ui';
 import { RobotSession, type RobotSessionOptions } from './RobotSession.js';
@@ -55,6 +56,32 @@ export const DEFAULT_EMULATOR_HOST = 'localhost:8081';
 /** The emulator's rendered-frame endpoint. */
 export const CAPTURE_PATH = '/capture';
 
+/**
+ * RC-53. How long a capture waits for the real world's camera to start
+ * producing frames before it reports a failure.
+ *
+ * Selecting the real world mounts the panel synchronously, but neither the
+ * panel's `getUserMedia` call nor the video element's first decoded frame is
+ * synchronous. Measured against Chromium's fake device the stream went live
+ * 133 ms after the run started while a capture was issued at 110 ms, so the
+ * capture lost by 23 ms; real hardware is slower still, because a sensor has to
+ * spin up. That window used to fail the capture outright. It now waits.
+ *
+ * 5 s matches vue-ui's own DEFAULT_HTTP_SNAPSHOT_TIMEOUT_MS — the deadline the
+ * other capture source in this stack already uses — and is far longer than any
+ * camera start observed here. Exhausting it is therefore a REAL failure (the
+ * camera is denied, absent, or held by another application), not a warm-up,
+ * which is what makes the "Is the camera active?" the model then sees an honest
+ * question rather than a race reported as a fault.
+ */
+export const CAMERA_READY_TIMEOUT_MS = 5_000;
+
+/**
+ * How often the bounded wait re-checks. Short enough that the wait costs at
+ * most about one frame beyond the camera actually being ready.
+ */
+export const CAMERA_READY_POLL_MS = 25;
+
 /** The hosts the two worlds live on, resolved from env by the caller. */
 export interface WorldHosts {
   robotHost: string;
@@ -89,6 +116,19 @@ export function captureUrlForWorld(worldId: WorldId, hosts: WorldHosts): string 
 
 /** The bits of a mounted <PkWebcamPanel> the capabilities need. */
 export interface WebcamPanelLike {
+  /**
+   * Whether the panel's media stream is live: `getUserMedia` has resolved and
+   * the <video> element is wired to the stream. FALSE throughout the panel's
+   * first moments — the window RC-53 closes — and false again after
+   * `stopCamera()`, which is what the simulated world does to the panel it
+   * keeps mounted.
+   *
+   * Required rather than optional on purpose. There is no honest default for
+   * an absent value: read as live it silently reinstates the race for every
+   * caller that forgets it, and read as not-live it strands them. Requiring it
+   * makes the type-checker enumerate the construction sites instead.
+   */
+  isActive: boolean;
   captureFrame(): string | null;
   composeBeforeAfter(before: string, after: string): Promise<string | null>;
 }
@@ -112,6 +152,43 @@ export interface WorldCapabilitiesDeps {
   onSimulatedFrame?: (frame: string | null) => void;
   /** Injected in tests so the snapshot source can be observed; defaults to the real one. */
   createSnapshotSource?: typeof createHttpSnapshotCaptureSource;
+  /**
+   * Overrides {@link CAMERA_READY_TIMEOUT_MS}. Injected so a test can exercise
+   * the deadline in milliseconds rather than seconds — the timeout is part of
+   * the behaviour, so a test that never reaches it has not covered it.
+   */
+  cameraReadyTimeoutMs?: number;
+  /** Overrides {@link CAMERA_READY_POLL_MS}, for the same reason. */
+  cameraReadyPollMs?: number;
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The panel's current frame if it is one the rest of the stack can actually
+ * use, else null.
+ *
+ * The validator is `frameToEnvelope` — vue-ui's own parser, the one
+ * `capture_image`'s envelope is built with — so this predicate cannot disagree
+ * with its consumer about what counts as a frame. That is load-bearing, not
+ * tidiness: a live stream whose <video> has not decoded its metadata yet still
+ * reports `videoWidth` 0, and a 0x0 canvas serialises to the string `data:,`,
+ * which is truthy and is not an image. A hand-rolled check that accepted it
+ * would reproduce exactly the failure this node exists to remove, one frame
+ * later.
+ */
+function decodableFrame(panel: WebcamPanelLike): string | null {
+  let frame: string | null;
+  try {
+    frame = panel.captureFrame();
+  } catch {
+    // A capture can throw while the element is being torn down. Treat it as
+    // "not yet" and let the deadline decide — an escaping rejection would be
+    // reported as a failed run rather than as a failed capture.
+    return null;
+  }
+  return frameToEnvelope(frame) ? frame : null;
 }
 
 /**
@@ -142,17 +219,70 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
     return frame;
   }
 
+  const readyTimeoutMs = deps.cameraReadyTimeoutMs ?? CAMERA_READY_TIMEOUT_MS;
+  const readyPollMs = deps.cameraReadyPollMs ?? CAMERA_READY_POLL_MS;
+
+  // RC-53 — WHAT "READY" MEANS HERE, so the next reader does not have to
+  // re-derive which of two meanings is in force.
+  //
+  // Readiness is THE MEDIA STREAM IS FLOWING. It is NOT "the webcam panel is
+  // mounted", which is what this predicate used to say. Those are two different
+  // instants: mounting is synchronous and immediate, whereas the panel's
+  // getUserMedia and its first decoded frame are neither, so "mounted" reported
+  // ready for a window in which every capture came back empty and the model was
+  // told the camera was inactive when it was merely starting.
+  //
+  // The capture path agrees with this definition rather than merely being
+  // guarded by it: `whenReady` below lets a caller wait for the stream instead
+  // of being refused, and `captureRealFrame` waits again for a frame that
+  // actually decodes. Both are bounded by CAMERA_READY_TIMEOUT_MS, so a camera
+  // that is genuinely absent still fails, and fails for that reason.
+  function isReady(): boolean {
+    const panel = deps.getWebcamPanel();
+    // The panel is required in BOTH worlds: composeBeforeAfter lives on it.
+    if (panel == null) return false;
+    // The simulated world reads frames over HTTP and never touches the camera,
+    // so what it needs ready is a configured snapshot target.
+    if (deps.getWorldId() === SIMULATED_WORLD_ID) return snapshotSource.isReady();
+    return panel.isActive;
+  }
+
+  /**
+   * Resolve once readiness holds, or once the deadline passes — never reject.
+   * Callers gate on `isReady()` afterwards, so a timeout surfaces as the
+   * ordinary not-ready failure rather than as a thrown run error.
+   */
+  async function whenReady(): Promise<void> {
+    const deadline = Date.now() + readyTimeoutMs;
+    while (!isReady() && Date.now() < deadline) {
+      await sleep(readyPollMs);
+    }
+  }
+
+  /**
+   * The real world's frame: the first one the panel produces that actually
+   * decodes, or null once the deadline passes. See `decodableFrame` for why a
+   * live stream is not on its own enough.
+   */
+  async function captureRealFrame(): Promise<string | null> {
+    const deadline = Date.now() + readyTimeoutMs;
+    for (;;) {
+      const panel = deps.getWebcamPanel();
+      if (panel != null && panel.isActive) {
+        const frame = decodableFrame(panel);
+        if (frame != null) return frame;
+      }
+      if (Date.now() >= deadline) return null;
+      await sleep(readyPollMs);
+    }
+  }
+
   return {
-    // The panel is required in BOTH worlds: composeBeforeAfter lives on it. In
-    // the simulated world a configured snapshot target is required too.
-    isReady: () => {
-      if (deps.getWebcamPanel() == null) return false;
-      if (deps.getWorldId() === SIMULATED_WORLD_ID) return snapshotSource.isReady();
-      return true;
-    },
+    isReady,
+    whenReady,
     captureFrame: () => {
       if (deps.getWorldId() === SIMULATED_WORLD_ID) return captureSimulatedFrame();
-      return deps.getWebcamPanel()?.captureFrame() ?? null;
+      return captureRealFrame();
     },
     composeBeforeAfter: (before, after) =>
       deps.getWebcamPanel()?.composeBeforeAfter(before, after) ?? Promise.resolve(null),

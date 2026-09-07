@@ -114,9 +114,28 @@ export class RobotSession {
     return `http://${this.robotHost}${path}`;
   }
 
+  // RC-53: the one seam every client-fulfilled tool call enters the browser
+  // through, and therefore the one place the startup wait belongs.
+  //
+  // Both gates below it — runRecipe's own, and captureImageResult's inside
+  // vue-ui — ask `isReady()` and refuse outright when the answer is no. That is
+  // the right shape for a camera that is absent, and the wrong one for a camera
+  // that is starting, which is the state the panel is in for the first frames
+  // after the real world is selected. Waiting here, rather than loosening
+  // either gate, is what lets readiness keep meaning "the stream is flowing"
+  // while a capture issued inside the startup window still returns a frame.
+  //
+  // It is bounded and never rejects, so a camera that really is unavailable
+  // still reaches its gate and still fails there — only later, and for a reason
+  // that is no longer "you asked too early".
+  private awaitCameraStartup(): Promise<void> {
+    return this.caps.whenReady?.() ?? Promise.resolve();
+  }
+
   // Fulfil one client-side motion tool by running its recipe. Returns the JSON
   // string handed back to the model.
-  runMotion(def: RobotToolDef, args: unknown): Promise<string> {
+  async runMotion(def: RobotToolDef, args: unknown): Promise<string> {
+    await this.awaitCameraStartup();
     return runRecipe(def, args, this.caps);
   }
 
@@ -125,7 +144,8 @@ export class RobotSession {
   // (isReady + captureFrame) already satisfies its ImageCaptureSource shape.
   // The envelope contract ({mimeType,data}/{error} + the exact error strings)
   // is frozen there (RC-14 renderers key on it).
-  captureImage(): Promise<string> {
+  async captureImage(): Promise<string> {
+    await this.awaitCameraStartup();
     return captureImageResult(this.caps);
   }
 
