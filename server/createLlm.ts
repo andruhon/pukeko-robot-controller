@@ -48,7 +48,20 @@ export function createLlm(spec: LlmSpec): LlmSelection {
   if (spec.provider === 'ollama') {
     return {
       provider: 'ollama',
+      // RC-50: generation options (temperature, repeatLastN, think, …) come from
+      // the profile's `llm.ollama`. They are spread FIRST so that baseUrl and
+      // model — which say *what is being called*, not how it should generate —
+      // are written last and cannot be shadowed: a `pukeko.config.json` is parsed
+      // at runtime and never meets the type checker, so a key the interface does
+      // not declare can still arrive in that bag.
+      //
+      // With no options set the spread contributes nothing and this is exactly
+      // the two-field constructor argument it has always been. That is not a
+      // side effect to rely on quietly — every existing profile is on that path
+      // and every smoke observation was taken there, so `tests/createLlm.test.ts`
+      // asserts the resulting request body whole.
       llm: new ChatOllama({
+        ...spec.ollama,
         baseUrl: spec.baseUrl ?? 'http://localhost:11434',
         model: spec.model,
       }),

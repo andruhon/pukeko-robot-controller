@@ -34,6 +34,46 @@ export default defineConfig({
       // robot: { host: '192.168.4.1', preset: 'ACEBOTT-QD021' }, // overridable with ROBOT_HOST / ROBOT_PRESET
     },
 
+    // Same local model and same middleware as 'gemma-default', differing ONLY in
+    // `llm.ollama` — the generation options, which reach the /api/chat request
+    // (RC-50). Held equal that way, running one profile against the other is a
+    // clean comparison of the sampling settings and nothing else.
+    //
+    // The VALUES here are illustrative, not recommended: which settings actually
+    // help is an open question that needs a human driving the robot and recording
+    // both halves — time-to-complete AND whether the robot still reaches the
+    // target. Omit a key to leave ollama's own default in place; a profile that
+    // sets none behaves exactly like 'gemma-default'.
+    'gemma-tuned': {
+      llm: {
+        provider: 'ollama',
+        model: 'gemma4:31b',
+        ollama: {
+          // A switch, not a budget — this suppresses thinking rather than shortening it.
+          think: false,
+          temperature: 0.6, // the model's own default is 1
+          topK: 64,
+          topP: 0.95,
+          repeatPenalty: 1.15,
+          // Ollama's default repeat_last_n is a 64-token window, so a repeated
+          // passage longer than that is invisible to repeatPenalty. Widen it past
+          // the length of whatever is repeating.
+          repeatLastN: 512,
+          // `numCtx` is available too and is deliberately NOT set here: it changes
+          // what the model can see rather than how it samples, so setting it would
+          // confound the comparison this profile exists for. It also has to agree
+          // with contextPruner — the pruner summarizes at summarizeAtFraction ×
+          // maxContextTokens (21k with PRUNER_LOCAL), and ollama silently truncates
+          // a prompt longer than num_ctx, so a smaller window drops context with no
+          // error. Move the two together or not at all.
+        },
+      },
+      middleware: ['frontend-images', 'context-pruner', 'observability', 'lazy-tool-recovery'],
+      contextPruner: PRUNER_LOCAL,
+      observability: OBSERVABILITY,
+      lazyToolRecovery: { force: true },
+    },
+
     'gpt-5.5': {
       llm: { provider: 'openai', model: 'gpt-5.5' },
       middleware: ['frontend-images', 'context-pruner', 'observability'],
