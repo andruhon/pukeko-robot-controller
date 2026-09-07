@@ -57,8 +57,9 @@ export const DEFAULT_EMULATOR_HOST = 'localhost:8081';
 export const CAPTURE_PATH = '/capture';
 
 /**
- * RC-53. How long a capture waits for the real world's camera to start
- * producing frames before it reports a failure.
+ * RC-53. How long ONE client tool call waits for the real world's camera to
+ * start producing frames before it reports a failure. It is the budget for the
+ * whole call, not for each wait inside it — see `whenReady` below.
  *
  * Selecting the real world mounts the panel synchronously, but neither the
  * panel's `getUserMedia` call nor the video element's first decoded frame is
@@ -70,17 +71,23 @@ export const CAPTURE_PATH = '/capture';
  * 5 s matches vue-ui's own DEFAULT_HTTP_SNAPSHOT_TIMEOUT_MS — the deadline the
  * other capture source in this stack already uses — and is far longer than any
  * camera start observed here. Exhausting it is therefore a REAL failure (the
- * camera is denied, absent, or held by another application), not a warm-up,
- * which is what makes the "Is the camera active?" the model then sees an honest
- * question rather than a race reported as a fault.
+ * camera is denied, absent, or held by another application), not a warm-up, and
+ * that is what the motion path's expiry message says: the stream produced no
+ * usable frame within the deadline. `capture_image`'s expiry still asks whether
+ * the camera is active, because that string is frozen inside vue-ui's envelope
+ * contract and is not this repo's to change.
+ *
+ * Deliberately not exported: the two injection points on WorldCapabilitiesDeps
+ * are how a caller varies these, and an export with no reader is surface that
+ * invites one.
  */
-export const CAMERA_READY_TIMEOUT_MS = 5_000;
+const CAMERA_READY_TIMEOUT_MS = 5_000;
 
 /**
- * How often the bounded wait re-checks. Short enough that the wait costs at
- * most about one frame beyond the camera actually being ready.
+ * How often a wait re-checks. Short enough that it costs at most about one
+ * frame beyond the camera actually being ready.
  */
-export const CAMERA_READY_POLL_MS = 25;
+const CAMERA_READY_POLL_MS = 25;
 
 /** The hosts the two worlds live on, resolved from env by the caller. */
 export interface WorldHosts {
@@ -235,7 +242,7 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
   // The capture path agrees with this definition rather than merely being
   // guarded by it: `whenReady` below lets a caller wait for the stream instead
   // of being refused, and `captureRealFrame` waits again for a frame that
-  // actually decodes. Both are bounded by CAMERA_READY_TIMEOUT_MS, so a camera
+  // actually decodes. The two share one deadline per tool call, so a camera
   // that is genuinely absent still fails, and fails for that reason.
   function isReady(): boolean {
     const panel = deps.getWebcamPanel();
@@ -248,33 +255,69 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
   }
 
   /**
-   * Resolve once readiness holds, or once the deadline passes — never reject.
-   * Callers gate on `isReady()` afterwards, so a timeout surfaces as the
-   * ordinary not-ready failure rather than as a thrown run error.
+   * Poll `attempt` until it yields a value or `deadline` passes, then answer
+   * with what it has.
+   *
+   * Always tries at least once, and never rejects: an expired deadline is an
+   * ANSWER (null), not an error. Every caller has a gate of its own to fail at,
+   * and a rejection escaping from here would be reported to the model as a
+   * failed run rather than as a failed capture.
    */
-  async function whenReady(): Promise<void> {
-    const deadline = Date.now() + readyTimeoutMs;
-    while (!isReady() && Date.now() < deadline) {
+  async function pollUntil<T>(deadline: number, attempt: () => T | null): Promise<T | null> {
+    for (;;) {
+      const value = attempt();
+      if (value != null) return value;
+      if (Date.now() >= deadline) return null;
       await sleep(readyPollMs);
     }
   }
 
+  // RC-53 — ONE DEADLINE PER TOOL CALL, opened at the seam.
+  //
+  // `whenReady` records the instant the current call runs out of patience, and
+  // the capture that follows measures itself against that same instant instead
+  // of starting a fresh deadline of its own.
+  //
+  // Without that the deadlines COMPOSE rather than bound. `whenReady` can spend
+  // the entire budget waiting for the stream, and a capture that then started
+  // its own would put `capture_image` at just under 2x the configured value and
+  // a motion recipe — the wait, the Before frame, the After frame — at just
+  // under 3x. A documented 5 s deadline that can take 15 s is not a deadline,
+  // and the model is the one left holding the wait.
+  //
+  // What this enforces is exactly "one call through RobotSession's seam", which
+  // awaits `whenReady()` before either gate. A capture reached WITHOUT the seam
+  // finds no window open and gets a fresh deadline — the behaviour it had
+  // before, and what a direct `captureFrame()` call still sees.
+  //
+  // Every wait still attempts at least once, so the After frame of a long
+  // motion takes its shot against a camera that is by then streaming, even
+  // though the window closed while the robot was walking. What sharing costs is
+  // the right to keep RETRYING past the call's own deadline, which is the thing
+  // that was never bounded.
+  let callDeadline: number | null = null;
+
+  /**
+   * Resolve once readiness holds, or once the call's deadline passes — never
+   * reject. Callers gate on `isReady()` afterwards, so a timeout surfaces as
+   * the ordinary not-ready failure rather than as a thrown run error.
+   */
+  async function whenReady(): Promise<void> {
+    callDeadline = Date.now() + readyTimeoutMs;
+    await pollUntil(callDeadline, () => (isReady() ? true : null));
+  }
+
   /**
    * The real world's frame: the first one the panel produces that actually
-   * decodes, or null once the deadline passes. See `decodableFrame` for why a
-   * live stream is not on its own enough.
+   * decodes, or null once the call's deadline passes. See `decodableFrame` for
+   * why a live stream is not on its own enough.
    */
   async function captureRealFrame(): Promise<string | null> {
-    const deadline = Date.now() + readyTimeoutMs;
-    for (;;) {
+    return pollUntil(callDeadline ?? Date.now() + readyTimeoutMs, () => {
       const panel = deps.getWebcamPanel();
-      if (panel != null && panel.isActive) {
-        const frame = decodableFrame(panel);
-        if (frame != null) return frame;
-      }
-      if (Date.now() >= deadline) return null;
-      await sleep(readyPollMs);
-    }
+      if (panel == null || !panel.isActive) return null;
+      return decodableFrame(panel);
+    });
   }
 
   return {

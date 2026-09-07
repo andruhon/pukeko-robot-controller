@@ -87,11 +87,21 @@ const MOTION_DESCRIPTION_TAIL =
 // the After frame is captured. That is exactly why the halt belongs here as
 // recipe DATA and not as a hardcoded call: a robot whose gait self-terminates
 // after `steps` cycles would simply drop this one line and behave correctly.
+//
+// RC-53: the Before-frame message says what happened rather than asking
+// whether the camera is active. By the time a capture fails, the call has
+// already waited out the camera-ready deadline (worlds.ts), so "is the camera
+// active?" is a question the code has just spent five seconds answering — and
+// it points a model at the one explanation that has been ruled out. What the
+// model needs instead is the two facts it must decide on: no frame arrived in
+// time, and the robot has not moved, because this step runs before the motion
+// endpoint is called.
 const MOTION_RECIPE: RecipeStep[] = [
   {
     step: 'captureFrame',
     as: 'before',
-    failMessage: 'Failed to capture Before frame. Is the camera active?',
+    failMessage:
+      'The camera stream produced no usable frame within the deadline, so no Before frame was captured and the robot has not moved.',
   },
   { step: 'http', path: { fromDef: 'clientEndpoint' }, withSteps: true },
   { step: 'http', path: '/stop', optional: true },

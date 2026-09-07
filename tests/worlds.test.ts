@@ -493,6 +493,179 @@ describe('RC-53 the real world is ready when its camera is streaming', () => {
     expect(await capabilities.captureFrame()).toBe(FRAME_DATA_URL)
     expect(calls).toEqual(['http://127.0.0.1:9099/capture'])
   })
+
+  // --- the wait's OTHER caller, and the deadline it spends ------------------
+
+  /**
+   * A panel that goes live and whose <video> then never decodes: every frame is
+   * the `data:,` a 0x0 canvas serialises to. This is the only shape that
+   * reaches the SECOND wait of a tool call — the first is satisfied the moment
+   * the stream is live — and the second wait is where the deadlines used to
+   * compose instead of bound.
+   */
+  function makeNeverDecodingPanel() {
+    return makeStartingPanel({ blankFramesWhenLive: Number.POSITIVE_INFINITY })
+  }
+
+  /** A real-world session over `panel`, plus the URLs its fetch was asked for. */
+  function realWorldSession(
+    panel: ReturnType<typeof makeStartingPanel>,
+    overrides?: { cameraReadyTimeoutMs?: number }
+  ) {
+    const { fn, calls } = makeFetch()
+    const capabilities = createWorldCapabilities({
+      getWorldId: () => 'real',
+      hosts: HOSTS,
+      getWebcamPanel: () => panel,
+      fetch: fn,
+      cameraReadyPollMs: 1,
+      ...overrides,
+    })
+    const session = createWorldSession({
+      worldId: 'real',
+      hosts: HOSTS,
+      presetId: ACEBOTT_QD021_PRESET.id,
+      capabilities,
+    })
+    return { session, calls }
+  }
+
+  it('waits for the camera on the MOTION path too, not only for capture_image', async () => {
+    // The half of the fix that nothing held. Deleting the wait from runMotion
+    // leaves the whole suite green while restoring THIS node's original defect
+    // on the motion path: runRecipe gates on isReady() and returns 'Webcam not
+    // initialized' before it runs a single step, so a motion tool issued during
+    // camera startup is refused for precisely the reason RC-53 exists to
+    // remove.
+    const panel = makeStartingPanel()
+    const { session, calls } = realWorldSession(panel)
+
+    // The stream comes up while the tool call is already waiting.
+    const live = setTimeout(() => {
+      panel.isActive = true
+    }, 20)
+
+    // Through the handler map, because that is the entry point CopilotKit
+    // actually calls — a wait on a method nothing routes to would prove nothing.
+    const result = JSON.parse(await session.clientToolHandlers.move_forward({}))
+    clearTimeout(live)
+
+    expect(result).toEqual({
+      mimeType: 'image/jpeg',
+      data: 'COMPOSITEBYTES',
+      motion: 'move_forward',
+    })
+    // ...and the robot was actually driven, rather than the call being answered
+    // by an error that happens to parse.
+    expect(calls).toEqual(['http://10.0.0.7/forward', 'http://10.0.0.7/stop'])
+  })
+
+  it('bounds a capture_image call by ONE deadline, not one per wait', async () => {
+    // The deadlines used to COMPOSE rather than bound: whenReady could spend
+    // the whole budget and the capture that followed started a fresh one.
+    // Measured at 181 ms against a configured 100 ms — just under 2x, and just
+    // under 3x on the motion path below.
+    //
+    // Fake timers rather than a wall-clock margin: the clock advances by exact
+    // amounts, so this asserts "settled within one deadline of simulated time"
+    // rather than "fast enough on this machine today".
+    vi.useFakeTimers()
+    try {
+      const panel = makeNeverDecodingPanel()
+      const { session } = realWorldSession(panel, { cameraReadyTimeoutMs: 100 })
+      // Live at 80 ms — late enough that a second, fresh 100 ms deadline would
+      // run on to 180 ms, and early enough to leave the first one 20 ms.
+      setTimeout(() => {
+        panel.isActive = true
+      }, 80)
+
+      const settled: string[] = []
+      void session.captureImage().then((r) => {
+        settled.push(r)
+      })
+
+      await vi.advanceTimersByTimeAsync(90)
+      // Still waiting: the shared deadline shortens the call, it does not make
+      // the second wait give up the moment the stream goes live.
+      expect(settled).toEqual([])
+
+      await vi.advanceTimersByTimeAsync(30)
+      expect(settled).toHaveLength(1)
+      // vue-ui's frozen envelope string. The capture_image half of the wording
+      // lives in that package and is out of this repo's reach; the motion half,
+      // below, is ours and says what actually happened.
+      expect(JSON.parse(settled[0])).toEqual({
+        error: 'Failed to capture frame. Is the camera active?',
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('bounds a MOTION call by one deadline too, and names what expired', async () => {
+    // The 3x path: whenReady, the Before frame, the After frame, each formerly
+    // free to start a deadline of its own.
+    vi.useFakeTimers()
+    try {
+      const panel = makeNeverDecodingPanel()
+      const { session, calls } = realWorldSession(panel, { cameraReadyTimeoutMs: 100 })
+      setTimeout(() => {
+        panel.isActive = true
+      }, 80)
+
+      const settled: string[] = []
+      void session.clientToolHandlers.move_forward({}).then((r) => {
+        settled.push(r)
+      })
+
+      await vi.advanceTimersByTimeAsync(90)
+      expect(settled).toEqual([])
+
+      await vi.advanceTimersByTimeAsync(30)
+      expect(settled).toHaveLength(1)
+      // The message is asserted verbatim because it is the whole deliverable
+      // here: after a deadline has been waited out, "Is the camera active?"
+      // points the model at the one explanation the wait already ruled out.
+      expect(JSON.parse(settled[0])).toEqual({
+        error:
+          'The camera stream produced no usable frame within the deadline, so no Before frame was captured and the robot has not moved.',
+        motion: 'move_forward',
+      })
+      // The message claims the robot has not moved. That is a claim about the
+      // wire, so it is checked against the wire.
+      expect(calls).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('honours the INJECTED deadline, so a shorter one really is shorter', async () => {
+    // The override exists to make these specs fast, and nothing held it:
+    // ignoring it and always using the production 5 s left every spec green,
+    // because 5 s fits inside vitest's 10 s ceiling. The deadline VALUE was
+    // therefore untested — the specs pinned the message at expiry, not when
+    // expiry came.
+    vi.useFakeTimers()
+    try {
+      // Never goes live at all: a denied or absent camera.
+      const panel = makeStartingPanel()
+      const { session } = realWorldSession(panel, { cameraReadyTimeoutMs: 100 })
+
+      const settled: string[] = []
+      void session.captureImage().then((r) => {
+        settled.push(r)
+      })
+
+      await vi.advanceTimersByTimeAsync(90)
+      expect(settled).toEqual([])
+
+      await vi.advanceTimersByTimeAsync(20)
+      expect(settled).toHaveLength(1)
+      expect(JSON.parse(settled[0])).toEqual({ error: 'Webcam not initialized' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 // --- the App.vue wiring seam ----------------------------------------------
