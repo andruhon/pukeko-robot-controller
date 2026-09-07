@@ -250,10 +250,19 @@ interface PruneStats {
   reasoningStripped: number;
 }
 
+// `keptImageIdx` is the prune's own answer to "which image-bearing turns did I
+// elect to keep", newest-first, as indices into the RETURNED array. It is
+// returned rather than recomputed by the caller because the summarize boundary
+// depends on it: two independent answers to that question would drift, and two
+// mechanisms disagreeing about which frames matter is precisely the defect the
+// boundary rule below exists to close.
+//
+// The indices stay valid because every step here is a `map` — messages are
+// copied in place, never inserted or removed, so position is preserved.
 function mechanicalPrune(
   messages: BaseMessage[],
   keepLatestImages: number
-): { messages: BaseMessage[]; stats: PruneStats } {
+): { messages: BaseMessage[]; stats: PruneStats; keptImageIdx: number[] } {
   const stats: PruneStats = {
     toolImageDataStripped: 0,
     humanImagesStripped: 0,
@@ -271,8 +280,12 @@ function mechanicalPrune(
   });
 
   // Step 2: keep the latest N image HumanMessages, prune image blocks from the rest.
+  // Kept and pruned come from ONE split of the same newest-first list, so the
+  // two can never disagree about which side a turn fell on.
   const imageIdxNewestFirst = findImageHumanMessageIndices(next);
-  const toPrune = new Set(imageIdxNewestFirst.slice(Math.max(0, keepLatestImages)));
+  const splitAt = Math.max(0, keepLatestImages);
+  const keptImageIdx = imageIdxNewestFirst.slice(0, splitAt);
+  const toPrune = new Set(imageIdxNewestFirst.slice(splitAt));
   if (toPrune.size > 0) {
     next = next.map((m, i) => {
       if (!toPrune.has(i)) return m;
@@ -302,7 +315,7 @@ function mechanicalPrune(
     return stripped;
   });
 
-  return { messages: next, stats };
+  return { messages: next, stats, keptImageIdx };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -386,7 +399,11 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
 
       const threadId = runtime?.configurable?.thread_id ?? '__default__';
       const beforeTokens = estimateTokens(messages, imageTokenBudget);
-      const { messages: pruned, stats } = mechanicalPrune(messages, keepLatestImages);
+      const {
+        messages: pruned,
+        stats,
+        keptImageIdx,
+      } = mechanicalPrune(messages, keepLatestImages);
       const afterPruneTokens = estimateTokens(pruned, imageTokenBudget);
 
       let rebuilt = pruned;
@@ -407,25 +424,71 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
           }
         }
 
-        // Where the boundary sits. Two cases, and a session with NO motion call
-        // anywhere is a real one — capture and narrate, question answering, any
-        // read-only interaction — not a degenerate history.
+        // Where the boundary sits. The anchor protects whatever state the NEXT
+        // model call depends on, and a session with no motion call anywhere is
+        // a real one — capture and narrate, question answering, any read-only
+        // interaction — not a degenerate history.
         //
-        // With a motion call, the boundary is that call: the anchor exists so
-        // summarization cannot eat the state the motion turn depends on, so the
-        // motion AIMessage, its ToolMessage and the injected Before/After
-        // composite (plus anything newer) are held back from the summarizer.
+        // 1. With a motion call, the boundary is that call: the motion
+        //    AIMessage, its ToolMessage and the injected Before/After composite
+        //    (plus anything newer) are held back from the summarizer.
         //
-        // With no motion call there is no such state to protect, so no anchor is
-        // needed and none is invented — the first HumanMessage stays as the
-        // boundary and everything after it is summarized. That is deliberate:
-        // the alternative is what this branch replaces, where the motion
-        // comparison could never hold against an unmoved sentinel and the
-        // middleware silently never summarized at all, letting context grow to
-        // the hard cap. Cutting at the very end cannot orphan a tool call from
-        // its result either — the whole tail goes, or none of it does.
+        // 2. With no motion call, the state the next call depends on is the
+        //    camera frame. `keepLatestImages` deliberately carries the newest
+        //    image-bearing turn through the mechanical strip, so the summarizer
+        //    must not then discard what the strip just elected to keep — two
+        //    policies in one middleware contradicting each other is how a
+        //    capture-and-narrate session reached its narrating call holding a
+        //    text recap and no picture. The anchor is therefore the OLDEST
+        //    image-bearing turn the strip kept (the newest one at the shipped
+        //    `keepLatestImages: 1`), taken from the strip's own answer rather
+        //    than recomputed here, so the two can never disagree.
+        //
+        // 3. Otherwise the boundary is the end of the history: with no frame
+        //    and no motion there is genuinely nothing to hold back.
+        //
+        // Rule 2 applies only while the tail it creates still fits under the
+        // summarize threshold, and that condition is load-bearing rather than
+        // defensive. Holding back everything from the frame onwards is cheap
+        // when the frame is recent — one image block, the same budget the strip
+        // already spends — but a session that captures once and then talks puts
+        // the frame near the START, and anchoring there hands the summarizer a
+        // two-message head while the uncompressed tail keeps growing. Measured
+        // at the shipped local profile, that shape crossed the 30000-token hard
+        // cap at round 58 and reached 62021 tokens while firing the summarizer
+        // on 80 of 120 turns: RC-27's own unbounded-growth defect, reintroduced
+        // by the anchor meant to fix a different one. Falling through to rule 3
+        // there keeps the guarantee that every rebuild lands under the
+        // threshold, and it costs the frame only in the shape where no bounded
+        // boundary could have kept it.
+        //
+        // Orphan safety, in all three cases: a tool call is never summarized
+        // away from its result. The injected image HumanMessage always sits
+        // AFTER the ToolMessage it was built from, so cutting at it leaves the
+        // AIMessage(tool_calls)/ToolMessage pair together in the head; a cut at
+        // the end takes the whole tail or none of it.
         const hasMotion = lastMotionAiIdx >= 0;
-        const boundaryIdx = hasMotion ? lastMotionAiIdx : pruned.length;
+        const oldestKeptImageIdx =
+          keptImageIdx.length > 0 ? keptImageIdx[keptImageIdx.length - 1] : -1;
+        const keptFrameTailTokens =
+          oldestKeptImageIdx >= 0
+            ? estimateTokens(pruned.slice(oldestKeptImageIdx), imageTokenBudget)
+            : 0;
+        const keptFrameTailFits =
+          oldestKeptImageIdx >= 0 && keptFrameTailTokens < summarizeThreshold;
+        const boundaryIdx = hasMotion
+          ? lastMotionAiIdx
+          : keptFrameTailFits
+            ? oldestKeptImageIdx
+            : pruned.length;
+        // Names which of the three rules chose the boundary. Pinned by test:
+        // with three branches the label is the only thing that says, from a log
+        // alone, which policy is in force on a live run.
+        const anchorLabel = hasMotion
+          ? 'last-motion'
+          : keptFrameTailFits
+            ? 'oldest-kept-frame'
+            : 'end-of-history (no frame worth holding back)';
 
         if (firstHumanIdx >= 0 && boundaryIdx > firstHumanIdx + 1) {
           const headSlice = pruned.slice(firstHumanIdx + 1, boundaryIdx);
@@ -443,7 +506,7 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
           console.log(
             `[context-pruner] thread=${threadId} threshold crossed ` +
               `(pruned=${afterPruneTokens} ≥ ${summarizeThreshold}); ` +
-              `anchor=${hasMotion ? 'last-motion' : 'first-human (no motion this session)'}; ` +
+              `anchor=${anchorLabel}; ` +
               `summarizing head of ${headSlice.length + 1} messages…`
           );
           try {
