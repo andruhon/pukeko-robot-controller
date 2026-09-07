@@ -15,6 +15,7 @@ import {
   createContextPrunerMiddleware,
   estimateTokens,
   __inflightSummariesForTest,
+  __unsummarizableThreadsForTest,
 } from '../src/agent/contextPrunerMiddleware.js'
 import { __resetMotionLogForTest, isMotionToolCall } from '../src/agent/motionLog.js'
 
@@ -56,6 +57,11 @@ function motionResultJson(motion: string, dataLen = 100): string {
 
 beforeEach(() => {
   __inflightSummariesForTest.clear()
+  // The "cannot summarize" warning is once per thread, and every test in this
+  // file shares one thread id — so without this reset the first case to reach
+  // the dead zone would consume the warning and later ones would pass or fail
+  // by file order rather than by behaviour.
+  __unsummarizableThreadsForTest.clear()
   // motionLog is shared module state; reset it so the pinned-state branch
   // exercised below (via afterModel) can't bleed motions into later tests.
   __resetMotionLogForTest()
@@ -609,19 +615,41 @@ describe('contextPrunerMiddleware — RC-17 mid-history SystemMessage fix', () =
 
   it('guard branch preserved: motion directly after the first human → no rewrite', async () => {
     const llm = makeStubLlm()
-    const mw = createContextPrunerMiddleware({ llm, ...FORCE_SUMMARIZE }) as HookContainer
+    // NOT FORCE_SUMMARIZE. That config sets the threshold to 1, so no tail of
+    // any size fits under it and the motion anchor can never apply — RC-60 gave
+    // rule 1 the tail-fits condition rule 2 already had, so under a threshold of
+    // 1 this history falls through to the end-of-history boundary and IS
+    // summarized. The guard branch is still reached, and this is the shape that
+    // reaches it: a preserved prefix large enough to cross the threshold on its
+    // own, with a motion at firstHumanIdx + 1 whose tail comfortably fits. That
+    // is also the only shape where the guard is a real limit rather than a
+    // symptom — nothing before the boundary is the summarizer's to compress.
+    const REALISTIC = {
+      maxContextTokens: 1000,
+      summarizeAtFraction: 0.5,
+      imageTokenBudget: 50,
+    } as const
+    const mw = createContextPrunerMiddleware({ llm, ...REALISTIC }) as HookContainer
     const before = getHook(mw.beforeModel)
 
     // lastMotionAiIdx === firstHumanIdx + 1 → the summarize window is empty and
     // nothing else needs pruning (plain ToolMessage, no image data) → undefined.
     const messages: BaseMessage[] = [
-      new HumanMessage('go'),
+      new HumanMessage('U'.repeat(4000)),
       new AIMessage({ content: '', tool_calls: [{ name: 'turn_right', args: { steps: 1 }, id: 'm' }] }),
       new ToolMessage({ content: '{}', tool_call_id: 'm', name: 'turn_right' }),
     ]
-    const result = await before({ messages }, runtime)
-    expect(result).toBeUndefined()
-    expect(llm.invoke).not.toHaveBeenCalled()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const result = await before({ messages }, runtime)
+      expect(result).toBeUndefined()
+      expect(llm.invoke).not.toHaveBeenCalled()
+      // The threshold really was crossed, so this is the guard branch and not
+      // the under-threshold path arriving at `undefined` for another reason.
+      expect(warnSpy.mock.calls.map((c) => String(c[0]))[0]).toContain('CANNOT SUMMARIZE')
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   it('empty-summary branch: summary not applied, no SystemMessage introduced', async () => {
@@ -2458,5 +2486,678 @@ describe('contextPrunerMiddleware — RC-56 a failed motion keeps the frame the 
     expect(summaries).toBeLessThan(ROUNDS / 2)
     expect(summaries).toBeGreaterThan(0)
     expect(framesHeld).toBeGreaterThan(ROUNDS * 0.9)
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────────────
+// RC-60 — rule 1 had no tail-fits condition, so an early motion call could pin
+// the boundary forever.
+//
+// Rule 2 (the kept-frame anchor) holds only while the tail it creates fits
+// under the summarize threshold. Rule 1 (the motion anchor) shipped without
+// that condition, so it anchored on the last motion call however early it sat
+// and however large the tail behind it grew. Two symptoms, one cause:
+//
+//   SILENT — the sole motion sits at index 1, so the boundary is 1, the
+//   `boundaryIdx > firstHumanIdx + 1` guard reads `1 > 1`, and NOTHING is
+//   summarized on any round for the life of the session. The only signal is the
+//   absence of a log line, which is indistinguishable from never having needed
+//   to summarize.
+//
+//   NOISY — the motion sits just above the guard, so every round summarizes a
+//   one-message head while the tail behind the boundary keeps growing. The
+//   summarizer runs constantly and the history still passes the hard cap.
+//
+// The same dead zone is reachable from the frame side: an anchor pulled to or
+// below `firstHumanIdx + 1` summarizes nothing either. Both are the one
+// question — what happens when every candidate boundary falls inside the guard
+// — so both are pinned here.
+//
+// Sessions are driven as loops over the real rewrite, fed back, because the
+// failure is a feedback property that a single-call boundary assertion cannot
+// see. Message classes are compared by reference or `getType()`, never
+// `instanceof`: this repo resolves two copies of @langchain/core.
+// ───────────────────────────────────────────────────────────────────────────
+describe('contextPrunerMiddleware — RC-60 an early motion call must not pin the boundary', () => {
+  const OVER_THRESHOLD = {
+    maxContextTokens: 1000,
+    summarizeAtFraction: 0.5,
+    imageTokenBudget: 50,
+  } as const
+
+  // The shipped local profile. The numbers this node was filed on are session
+  // numbers at THIS config, so the boundedness cases run against it rather than
+  // the scaled-down one.
+  const PRUNER_LOCAL = {
+    maxContextTokens: 30_000,
+    summarizeAtFraction: 0.7,
+    keepLatestImages: 1,
+    imageTokenBudget: 800,
+  } as const
+
+  function captureResultJson(dataLen = 400): string {
+    return JSON.stringify({ mimeType: 'image/jpeg', data: 'X'.repeat(dataLen), captured: true })
+  }
+
+  function withoutRemoveMessages(result: unknown): BaseMessage[] {
+    return (result as { messages: BaseMessage[] }).messages.filter((m) => m.getType() !== 'remove')
+  }
+
+  function summaryMessages(messages: BaseMessage[]): HumanMessage[] {
+    return messages.filter(
+      (m): m is HumanMessage =>
+        isHumanMessage(m) && String(m.content).startsWith('[Context summary]')
+    )
+  }
+
+  function hasImage(m: BaseMessage): boolean {
+    return (
+      Array.isArray(m.content) &&
+      (m.content as { type?: string }[]).some(
+        (b) => b && (b.type === 'image' || b.type === 'image_url')
+      )
+    )
+  }
+
+  function orphanToolMessageIds(messages: BaseMessage[]): string[] {
+    const callIds = new Set<string>()
+    for (const m of messages) {
+      const tcs = (m as AIMessage).tool_calls
+      if (Array.isArray(tcs)) for (const tc of tcs) if (tc.id) callIds.add(tc.id)
+    }
+    return messages
+      .filter((m) => m.getType() === 'tool')
+      .filter((m) => {
+        const id = (m as ToolMessage).tool_call_id
+        return !id || !callIds.has(id)
+      })
+      .map((m) => String(m.id ?? '(no id)'))
+  }
+
+  function motionTurn(round: number): BaseMessage[] {
+    return [
+      new AIMessage({
+        id: `ai-motion-${round}`,
+        content: '',
+        tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: `tc-mv-${round}` }],
+      }),
+      new ToolMessage({
+        id: `tm-motion-${round}`,
+        content: motionResultJson('move_forward (steps=2)', 400),
+        tool_call_id: `tc-mv-${round}`,
+        name: 'move_forward',
+      }),
+      new HumanMessage({
+        id: `h-frame-${round}`,
+        content: [{ type: 'text', text: 'Before/After frames.' }, imageBlock()],
+      }),
+    ]
+  }
+
+  // The talking rounds every over-cap shape here shares: a long assistant turn
+  // and a short operator question, none of it a motion or a frame.
+  function talkRound(round: number): BaseMessage[] {
+    return [
+      new AIMessage({ id: `ai-answer-${round}`, content: 'A'.repeat(4000) }),
+      new HumanMessage({ id: `h-q-${round}`, content: 'And to the left of that?' }),
+    ]
+  }
+
+  interface SessionResult {
+    peak: number
+    summaries: number
+    framesHeld: number
+    anchorLabels: string[]
+    warnings: string[]
+  }
+
+  async function runSession(
+    cfg: { maxContextTokens: number; summarizeAtFraction: number; imageTokenBudget: number },
+    seed: () => BaseMessage[],
+    round: (r: number) => BaseMessage[],
+    rounds: number
+  ): Promise<SessionResult> {
+    const invoke = vi.fn(async () => ({ content: SUMMARY_TEXT }))
+    const llm = { invoke } as unknown as Parameters<typeof createContextPrunerMiddleware>[0]['llm']
+    const mw = createContextPrunerMiddleware({ llm, ...cfg }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const anchorLabels: string[] = []
+    const warnings: string[] = []
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      const line = String(args[0])
+      const match = line.match(/anchor=([^;]*)/)
+      if (match) anchorLabels.push(match[1])
+    })
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+      warnings.push(String(args[0]))
+    })
+
+    let state = seed()
+    let peak = 0
+    let framesHeld = 0
+    try {
+      for (let r = 0; r < rounds; r++) {
+        const result = await before({ messages: state }, runtime)
+        const body = result ? withoutRemoveMessages(result) : state
+        peak = Math.max(peak, estimateTokens(body, cfg.imageTokenBudget))
+        if (body.some(hasImage)) framesHeld++
+        // Orphan safety is a per-round invariant on every branch, not a
+        // property of one fixture.
+        expect(orphanToolMessageIds(body)).toEqual([])
+        state = [...body, ...round(r)]
+      }
+    } finally {
+      logSpy.mockRestore()
+      warnSpy.mockRestore()
+    }
+    return { peak, summaries: invoke.mock.calls.length, framesHeld, anchorLabels, warnings }
+  }
+
+  // ── The silent shape ──────────────────────────────────────────────────────
+
+  it('THE DEFECT (silent): one motion call at index 1 then talk stays under the hard cap and DOES summarize', async () => {
+    // Red before the fix at the shipped local profile: peak 60679 estimated
+    // tokens against a 30000 cap with the summarizer called ZERO times over 60
+    // rounds. `lastMotionAiIdx` is 1, so the boundary is 1 and the guard reads
+    // `1 > 1` on every round, forever.
+    const ROUNDS = 60
+    const { peak, summaries } = await runSession(
+      PRUNER_LOCAL,
+      () => [
+        new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' }),
+        ...motionTurn(0),
+      ],
+      talkRound,
+      ROUNDS
+    )
+
+    expect(peak).toBeLessThan(PRUNER_LOCAL.maxContextTokens)
+    // And it summarized at all — the assertion the pre-fix code could not
+    // satisfy, and the one that separates "bounded" from "bounded by accident".
+    expect(summaries).toBeGreaterThan(0)
+    expect(summaries).toBeLessThan(ROUNDS / 2)
+  })
+
+  // ── The noisy shapes ──────────────────────────────────────────────────────
+  //
+  // "The summarizer never fires" describes one shape, not the mechanism. When
+  // the motion sits just ABOVE the guard the summarizer runs on most rounds and
+  // the history still passes the cap, so a fix validated only against the
+  // silent shape would leave these live.
+
+  it('THE DEFECT (noisy): a motion at index 2 summarizes on most rounds and STILL passed the cap', async () => {
+    // Red before the fix: peak 60706 with the summarizer called on 40 of 60
+    // rounds. The boundary sits at 2 forever, so each round compresses a
+    // one-message head and the tail behind it grows unchecked.
+    const ROUNDS = 60
+    const { peak, summaries } = await runSession(
+      PRUNER_LOCAL,
+      () => [
+        new HumanMessage({ id: 'h-user', content: 'Look, then drive, then talk to me.' }),
+        new AIMessage({ id: 'ai-think', content: 'Looking first.' }),
+        ...motionTurn(0),
+      ],
+      talkRound,
+      ROUNDS
+    )
+
+    expect(peak).toBeLessThan(PRUNER_LOCAL.maxContextTokens)
+    expect(summaries).toBeGreaterThan(0)
+    // Not achieved by summarizing on every turn, which is what an anchor that
+    // never makes progress looks like from the outside — and is exactly what
+    // this shape did before the fix.
+    expect(summaries).toBeLessThan(ROUNDS / 2)
+  })
+
+  it('THE DEFECT (noisy): capture first, then one motion, then talk — same numbers, different history', async () => {
+    // The second noisy route, and not a restatement of the first: here the
+    // motion is preceded by a complete capture turn, so the boundary sits at
+    // index 4 rather than 2 and the kept frame is the motion composite rather
+    // than the capture one. Red before the fix at peak 60706 / 40 summaries.
+    const ROUNDS = 60
+    const { peak, summaries } = await runSession(
+      PRUNER_LOCAL,
+      () => [
+        new HumanMessage({ id: 'h-user', content: 'Look, then drive, then talk to me.' }),
+        new AIMessage({
+          id: 'ai-capture-0',
+          content: '',
+          tool_calls: [{ name: 'capture_image', args: {}, id: 'tc-cap-0' }],
+        }),
+        new ToolMessage({
+          id: 'tm-cap-0',
+          content: captureResultJson(),
+          tool_call_id: 'tc-cap-0',
+          name: 'capture_image',
+        }),
+        new HumanMessage({
+          id: 'h-cap-frame-0',
+          content: [{ type: 'text', text: 'Frame 0.' }, imageBlock()],
+        }),
+        ...motionTurn(0),
+      ],
+      talkRound,
+      ROUNDS
+    )
+
+    expect(peak).toBeLessThan(PRUNER_LOCAL.maxContextTokens)
+    expect(summaries).toBeGreaterThan(0)
+    expect(summaries).toBeLessThan(ROUNDS / 2)
+  })
+
+  it('the single-call view: the motion anchor gives way when its own tail would not fit', async () => {
+    // The loop above, seen in one call. A motion near the START of a long
+    // history has a tail that is itself over the threshold, so anchoring there
+    // compresses nothing; the boundary falls through to the end of the history
+    // and the whole span after the first human message is compressed. The
+    // frame is spent, which is the same trade rule 2 already makes: this is the
+    // shape where no bounded boundary could have kept it.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const user = new HumanMessage({ id: 'h-user', content: 'Drive once, then answer.' })
+    const messages: BaseMessage[] = [user, ...motionTurn(0)]
+    for (let i = 0; i < 12; i++) {
+      messages.push(new AIMessage({ id: `ai-answer-${i}`, content: 'A'.repeat(400) }))
+    }
+
+    const result = await before({ messages }, runtime)
+
+    expect(llm.invoke).toHaveBeenCalledTimes(1)
+    const rebuilt = withoutRemoveMessages(result)
+    expect(rebuilt).toHaveLength(2)
+    expect(rebuilt[0]).toBe(user)
+    expect(summaryMessages(rebuilt)).toHaveLength(1)
+    expect(orphanToolMessageIds(rebuilt)).toEqual([])
+    // The motion turn went to the summarizer rather than being held back — the
+    // observable difference from the pre-fix boundary, which held it and
+    // summarized nothing.
+    const sentIds = (llm.invoke.mock.calls[0][0] as BaseMessage[]).map((m) => m.id)
+    expect(sentIds).toContain('ai-motion-0')
+    expect(sentIds).toContain('tm-motion-0')
+  })
+
+  // ── The dead zone from the frame side ─────────────────────────────────────
+
+  function lightRound(round: number): BaseMessage[] {
+    return [
+      new AIMessage({ id: `ai-say-${round}`, content: 'Still stuck here.' }),
+      new HumanMessage({ id: `h-q-${round}`, content: 'Try again?' }),
+    ]
+  }
+
+  function earlyFailedMotion(): BaseMessage[] {
+    return [
+      new AIMessage({
+        id: 'ai-motion-0',
+        content: '',
+        tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'tc-mv-0' }],
+      }),
+      new ToolMessage({
+        id: 'tm-motion-0',
+        content: JSON.stringify({ error: 'robot unreachable' }),
+        tool_call_id: 'tc-mv-0',
+        name: 'move_forward',
+        status: 'error',
+      }),
+      new HumanMessage({
+        id: 'h-fail-0',
+        content: 'Motion (move_forward) failed: robot unreachable',
+      }),
+    ]
+  }
+
+  it('the frame anchor also gives way when it lands ON the guard: client-supplied system role', async () => {
+    // The other direction into the same dead zone. The AG-UI ingest does not
+    // filter what a client sends: a system role makes `firstHumanIdx` 1, so an
+    // image-bearing message at index 2 sits exactly on the guard floor, the
+    // boundary is pulled there, and nothing is summarized — while the motion
+    // boundary one message later would have compressed the history fine.
+    //
+    // Red before the fix: peak 1050 against a 1000 cap over 40 rounds. The dead
+    // zone holds for as long as the frame's tail stays under the threshold, so
+    // this is a cap breach rather than merely deferred pruning.
+    const ROUNDS = 40
+    const { peak, summaries } = await runSession(
+      OVER_THRESHOLD,
+      () => [
+        new SystemMessage({ id: 'sys', content: 'S'.repeat(1400) }),
+        new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' }),
+        new HumanMessage({
+          id: 'h-frame-0',
+          content: [{ type: 'text', text: 'Here is what I see.' }, imageBlock()],
+        }),
+        ...earlyFailedMotion(),
+      ],
+      lightRound,
+      ROUNDS
+    )
+
+    expect(peak).toBeLessThan(OVER_THRESHOLD.maxContextTokens)
+    expect(summaries).toBeGreaterThan(0)
+  })
+
+  it('the frame anchor also gives way when it lands ON the guard: image-bearing second message', async () => {
+    // The second client route, with no system role anywhere: a large opening
+    // instruction followed immediately by an image-bearing turn puts the frame
+    // at index 1 with `firstHumanIdx` 0. A fix keyed on the presence of a
+    // system message would pass the case above and fail this one.
+    //
+    // Red before the fix: peak 1040 against a 1000 cap over 40 rounds.
+    const ROUNDS = 40
+    const { peak, summaries } = await runSession(
+      OVER_THRESHOLD,
+      () => [
+        new HumanMessage({ id: 'h-user', content: 'U'.repeat(1400) }),
+        new HumanMessage({
+          id: 'h-frame-0',
+          content: [{ type: 'text', text: 'Here is what I see.' }, imageBlock()],
+        }),
+        ...earlyFailedMotion(),
+      ],
+      lightRound,
+      ROUNDS
+    )
+
+    expect(peak).toBeLessThan(OVER_THRESHOLD.maxContextTokens)
+    expect(summaries).toBeGreaterThan(0)
+  })
+
+  it('the single-call view of the clamp: a frame ON the guard floor is given up so something can be compressed', async () => {
+    // The session pair above is not enough on its own to pin the clamp, and
+    // that is worth stating rather than assuming: with rule 1 now bounded, a
+    // session whose frame anchor is left in place still self-corrects — the
+    // frame's tail eventually crosses the threshold, the anchor drops out, and
+    // the end-of-history fallthrough compresses hard enough to keep the peak
+    // under the cap. Measured: removing the clamp leaves both of those green.
+    // What only a single call can see is the round where the clamp acts, and
+    // that is what this pins, on both client routes.
+    async function rebuildOf(messages: BaseMessage[]) {
+      const llm = makeStubLlm()
+      const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const result = await getHook(mw.beforeModel)({ messages }, runtime)
+        return { llm, rebuilt: result ? withoutRemoveMessages(result) : [] }
+      } finally {
+        logSpy.mockRestore()
+        warnSpy.mockRestore()
+      }
+    }
+
+    // Route A — a client-supplied system role puts firstHumanIdx at 1, so the
+    // frame at index 2 sits exactly on the guard floor.
+    const routeA = await rebuildOf([
+      new SystemMessage({ id: 'sys', content: 'S'.repeat(2000) }),
+      new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' }),
+      new HumanMessage({
+        id: 'h-frame-0',
+        content: [{ type: 'text', text: 'Here is what I see.' }, imageBlock()],
+      }),
+      ...earlyFailedMotion(),
+    ])
+    expect(routeA.llm.invoke).toHaveBeenCalledTimes(1)
+    expect(routeA.rebuilt.map((m) => m.id)).toEqual([
+      'sys',
+      'h-user',
+      undefined,
+      'ai-motion-0',
+      'tm-motion-0',
+      'h-fail-0',
+    ])
+    expect(summaryMessages(routeA.rebuilt)).toHaveLength(1)
+    // The frame is spent. That is the trade, and it is not a loss: no boundary
+    // that kept it could have compressed anything at all.
+    expect(routeA.rebuilt.filter(hasImage)).toHaveLength(0)
+    expect(orphanToolMessageIds(routeA.rebuilt)).toEqual([])
+
+    // Route B — no system role; a large opening instruction followed straight
+    // away by an image-bearing turn puts the frame at index 1.
+    const routeB = await rebuildOf([
+      new HumanMessage({ id: 'h-user', content: 'U'.repeat(2000) }),
+      new HumanMessage({
+        id: 'h-frame-0',
+        content: [{ type: 'text', text: 'Here is what I see.' }, imageBlock()],
+      }),
+      ...earlyFailedMotion(),
+    ])
+    expect(routeB.llm.invoke).toHaveBeenCalledTimes(1)
+    expect(routeB.rebuilt.map((m) => m.id)).toEqual([
+      'h-user',
+      undefined,
+      'ai-motion-0',
+      'tm-motion-0',
+      'h-fail-0',
+    ])
+    expect(summaryMessages(routeB.rebuilt)).toHaveLength(1)
+    expect(routeB.rebuilt.filter(hasImage)).toHaveLength(0)
+    expect(orphanToolMessageIds(routeB.rebuilt)).toEqual([])
+  })
+
+  // ── The degenerate case must not be silent ────────────────────────────────
+
+  // A history whose only over-threshold weight is the preserved prefix: a huge
+  // opening instruction, then a motion at `firstHumanIdx + 1` whose tail is
+  // tiny. Every candidate boundary is 1, the head would be a single message,
+  // and there is genuinely nothing to compress — the prefix is never the
+  // summarizer's to shrink.
+  function unsummarizableHistory(): BaseMessage[] {
+    return [
+      new HumanMessage({ id: 'h-user', content: 'U'.repeat(4000) }),
+      new AIMessage({
+        id: 'ai-motion-0',
+        content: '',
+        tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'tc-mv-0' }],
+      }),
+      new ToolMessage({
+        id: 'tm-motion-0',
+        content: JSON.stringify({ ok: true }),
+        tool_call_id: 'tc-mv-0',
+        name: 'move_forward',
+      }),
+    ]
+  }
+
+  it('a session that structurally cannot summarize says so — once per thread', async () => {
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await before({ messages: unsummarizableHistory() }, runtime)
+      // The threshold really was crossed and the summarizer really did not run
+      // — this is the guard branch, not the under-threshold path.
+      expect(llm.invoke).not.toHaveBeenCalled()
+      const warned = warnSpy.mock.calls.map((c) => String(c[0]))
+      expect(warned).toHaveLength(1)
+      expect(warned[0]).toContain('CANNOT SUMMARIZE')
+      expect(warned[0]).toContain('boundary=1')
+      expect(warned[0]).toContain('firstHuman=0')
+
+      // Once per thread: the next round is the same condition and must not
+      // re-report it, or a stuck session floods the log it is trying to be
+      // legible in.
+      await before({ messages: unsummarizableHistory() }, runtime)
+      expect(warnSpy.mock.calls).toHaveLength(1)
+    } finally {
+      warnSpy.mockRestore()
+      logSpy.mockRestore()
+    }
+  })
+
+  it('a session that has simply never needed to summarize says nothing — the two are distinguishable from the log alone', async () => {
+    // The control for the warning. Acceptance is that a structurally-unable
+    // session is TELLABLE from a never-needed one, which a line that fires on
+    // both would not satisfy.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      // Same shape, under the threshold.
+      await before(
+        {
+          messages: [
+            new HumanMessage({ id: 'h-user', content: 'Drive on.' }),
+            new AIMessage({
+              id: 'ai-motion-0',
+              content: '',
+              tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'tc-mv-0' }],
+            }),
+            new ToolMessage({
+              id: 'tm-motion-0',
+              content: JSON.stringify({ ok: true }),
+              tool_call_id: 'tc-mv-0',
+              name: 'move_forward',
+            }),
+          ],
+        },
+        runtime
+      )
+      expect(llm.invoke).not.toHaveBeenCalled()
+      expect(warnSpy.mock.calls).toHaveLength(0)
+    } finally {
+      warnSpy.mockRestore()
+      logSpy.mockRestore()
+    }
+  })
+
+  it('the warning re-arms once the thread has actually summarized again', async () => {
+    // A thread that recovers and later gets stuck again is news the second
+    // time. Without the re-arm the once-per-thread set would silence a genuinely
+    // new occurrence for the life of the process.
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({ llm, ...OVER_THRESHOLD }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await before({ messages: unsummarizableHistory() }, runtime)
+      expect(warnSpy.mock.calls).toHaveLength(1)
+
+      // A summarizable history on the same thread.
+      const recovering: BaseMessage[] = [
+        new HumanMessage({ id: 'h-user', content: 'Drive once, then answer.' }),
+      ]
+      for (let i = 0; i < 12; i++) {
+        recovering.push(new AIMessage({ id: `ai-answer-${i}`, content: 'A'.repeat(400) }))
+      }
+      await before({ messages: recovering }, runtime)
+      expect(llm.invoke).toHaveBeenCalledTimes(1)
+
+      await before({ messages: unsummarizableHistory() }, runtime)
+      expect(warnSpy.mock.calls).toHaveLength(2)
+    } finally {
+      warnSpy.mockRestore()
+      logSpy.mockRestore()
+    }
+  })
+
+  // ── The log names the two new fallthrough branches ────────────────────────
+
+  async function anchorLabelFor(messages: BaseMessage[], opts = {}): Promise<string> {
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({
+      llm,
+      ...OVER_THRESHOLD,
+      ...opts,
+    }) as HookContainer
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await getHook(mw.beforeModel)({ messages }, runtime)
+      const line = spy.mock.calls.map((c) => String(c[0])).find((l) => l.includes('anchor='))
+      return line ? (line.match(/anchor=([^;]*)/)?.[1] ?? '') : ''
+    } finally {
+      spy.mockRestore()
+      warnSpy.mockRestore()
+    }
+  }
+
+  it('the log names the two branches an anchor can drop out through', async () => {
+    // `anchor=` is the only thing that says from a live log which policy is in
+    // force. Two branches are new, and a run taking either of them while the
+    // log still reads `last-motion` would misreport exactly the change this
+    // node made.
+
+    // Rule 1 dropped out: its own tail is over the threshold.
+    const earlyMotion: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'Drive once, then answer.' }),
+      ...motionTurn(0),
+    ]
+    for (let i = 0; i < 12; i++) {
+      earlyMotion.push(new AIMessage({ id: `ai-answer-${i}`, content: 'A'.repeat(400) }))
+    }
+    expect(await anchorLabelFor(earlyMotion)).toBe(
+      'end-of-history (last motion tail over threshold)'
+    )
+
+    // Rule 2 dropped out: the frame it would anchor on sits on the guard floor,
+    // and the motion boundary behind it can still compress something.
+    const frameOnGuard: BaseMessage[] = [
+      new SystemMessage({ id: 'sys', content: 'S'.repeat(2000) }),
+      new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' }),
+      new HumanMessage({
+        id: 'h-frame-0',
+        content: [{ type: 'text', text: 'Here is what I see.' }, imageBlock()],
+      }),
+      ...earlyFailedMotion(),
+    ]
+    expect(await anchorLabelFor(frameOnGuard)).toBe(
+      'last-motion (kept frame below the summarize guard)'
+    )
+  })
+
+  it('the four existing anchor labels are unchanged on the histories that produced them', async () => {
+    // The successful-motion path and the two frame paths must keep reporting
+    // exactly what they reported before, because a relabelled branch reads from
+    // a live log as a behaviour change that did not happen.
+    const healthy: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'Drive on.' }),
+    ]
+    for (let i = 0; i < 6; i++) healthy.push(...motionTurn(i), new AIMessage({ id: `ai-narrate-${i}`, content: 'N'.repeat(400) }))
+    expect(await anchorLabelFor(healthy)).toBe('last-motion')
+
+    const textOnly: BaseMessage[] = [new HumanMessage({ id: 'h-user', content: 'Explain.' })]
+    for (let i = 0; i < 12; i++) {
+      textOnly.push(new AIMessage({ id: `ai-${i}`, content: 'A'.repeat(400) }))
+    }
+    expect(await anchorLabelFor(textOnly)).toBe('end-of-history (no frame worth holding back)')
+  })
+
+  // ── The path this node must not disturb ───────────────────────────────────
+
+  it('UNCHANGED: a healthy driving session never takes a fallthrough branch, and keeps its frames', async () => {
+    // The successful-motion path is the one RC-27's review cleared as
+    // byte-equivalent across eleven histories, and rule 1 is the line it rests
+    // on. Here the motion is always recent, so its tail always fits and the
+    // condition added by this node is satisfied on every round — asserted as a
+    // property of the whole session rather than of one call, so a config where
+    // it silently stopped holding would show up.
+    const ROUNDS = 60
+    const { peak, summaries, framesHeld, anchorLabels, warnings } = await runSession(
+      PRUNER_LOCAL,
+      () => [new HumanMessage({ id: 'h-user', content: 'Drive to the red cone.' })],
+      (r) => [new AIMessage({ id: `ai-think-${r}`, content: 'A'.repeat(4000) }), ...motionTurn(r)],
+      ROUNDS
+    )
+
+    expect(peak).toBeLessThan(PRUNER_LOCAL.maxContextTokens)
+    expect(summaries).toBeGreaterThan(0)
+    expect(summaries).toBeLessThan(ROUNDS / 2)
+    expect(framesHeld).toBeGreaterThan(ROUNDS * 0.9)
+    // Every round that chose a boundary chose rule 1, and none of them reported
+    // a dropped anchor.
+    expect(anchorLabels.length).toBeGreaterThan(0)
+    expect([...new Set(anchorLabels)]).toEqual(['last-motion'])
+    expect(warnings).toEqual([])
   })
 })

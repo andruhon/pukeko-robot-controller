@@ -27,6 +27,11 @@ const IMAGE_TOOL_NAMES: ReadonlySet<string> = new Set([...MOTION_TOOL_NAMES, 'ca
 // first instead of issuing a duplicate LLM round-trip.
 const inflightSummaries = new Map<string, Promise<string>>();
 
+// Threads already told, once, that they are over the threshold and structurally
+// unable to summarize. Membership is what makes the warning once-per-thread; an
+// applied summary removes the thread again, so a later re-entry is reported.
+const unsummarizableThreads = new Set<string>();
+
 const DEFAULT_SUMMARY_PROMPT = `You are compressing the early portion of a robot-control conversation so a small local model can stay on task within its context budget. The summary REPLACES the detailed history that came before it, so capture the operator's understanding so far — conclusions, not a play-by-play.
 
 Cover, in a few terse sentences:
@@ -471,22 +476,36 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
         // 3. With neither a motion call nor a kept frame the boundary is the
         //    end of the history: there is genuinely nothing to hold back.
         //
-        // The frame anchor applies only while the tail it creates still fits
-        // under the summarize threshold, and that condition is load-bearing
-        // rather than defensive — it is what keeps "earlier of the two" from
-        // being an anchor that can sit arbitrarily early. Holding back
-        // everything from the frame onwards is cheap when the frame is recent —
-        // one image block, the same budget the strip already spends — but a
-        // session that captures once and then talks puts the frame near the
-        // START, and anchoring there hands the summarizer a two-message head
-        // while the uncompressed tail keeps growing. Measured at the shipped
-        // local profile, that shape crossed the 30000-token hard cap at round
-        // 58 and reached 62021 tokens while firing the summarizer on 80 of 120
-        // turns: RC-27's own unbounded-growth defect, reintroduced by the anchor
-        // meant to fix a different one. When the condition fails the frame
-        // anchor drops out and the boundary is the motion turn, or the end of
-        // the history — which costs the frame only in the shape where no
-        // bounded boundary could have kept it.
+        // BOTH anchors apply only while the tail they create still fits under
+        // the summarize threshold, and that condition is load-bearing rather
+        // than defensive — it is what keeps an anchor from sitting arbitrarily
+        // early. Holding back everything from an anchor onwards is cheap when
+        // the anchor is recent — one image block, the same budget the strip
+        // already spends — but a session that acts once and then talks puts the
+        // anchor near the START, and anchoring there hands the summarizer a
+        // short head while the uncompressed tail keeps growing.
+        //
+        // For the frame anchor, measured at the shipped local profile, that
+        // shape crossed the 30000-token hard cap at round 58 and reached 62021
+        // tokens while firing the summarizer on 80 of 120 turns.
+        //
+        // The motion anchor fails the same way and worse, because it can also
+        // land ON the summarize guard below and take the middleware out of
+        // service entirely. A session that issues its one motion call at index
+        // 1 pins the boundary at 1 forever: the guard reads `1 > 1`, nothing is
+        // summarized on any round, and the only symptom is the ABSENCE of a log
+        // line. Measured at the same profile over 60 rounds of capture-once,
+        // move-once, then talk: 60679 estimated tokens against a 30000 cap with
+        // the summarizer called zero times. The same missing condition is noisy
+        // rather than silent when the motion sits just above the guard — a
+        // motion at index 2 leaves the boundary there, so every round summarizes
+        // a one-message head and the tail behind it still grows: 60715 tokens
+        // with the summarizer called on 40 of 60 rounds.
+        //
+        // When a condition fails, that anchor drops out and the boundary falls
+        // through to what the other rules choose — the other anchor, or the end
+        // of the history. That costs the anchor's protection only in the shape
+        // where no bounded boundary could have kept it.
         //
         // Be precise about WHAT is bounded, because it is not the whole
         // rebuild: the condition is checked on the tail alone. The rebuild is
@@ -513,57 +532,69 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
         const hasMotion = lastMotionAiIdx >= 0;
         const oldestKeptImageIdx =
           keptImageIdx.length > 0 ? keptImageIdx[keptImageIdx.length - 1] : -1;
-        const keptFrameTailTokens =
-          oldestKeptImageIdx >= 0
-            ? estimateTokens(pruned.slice(oldestKeptImageIdx), imageTokenBudget)
-            : 0;
+        // One tail measurement, used by both anchors — the two conditions are
+        // the same question asked at two positions, so they share an expression
+        // rather than each growing their own.
+        const tailTokensFrom = (idx: number): number =>
+          estimateTokens(pruned.slice(idx), imageTokenBudget);
         const keptFrameTailFits =
-          oldestKeptImageIdx >= 0 && keptFrameTailTokens < summarizeThreshold;
-        // The boundary with no frame in play: the last motion turn, else the
-        // end of the history.
-        const motionOrEndIdx = hasMotion ? lastMotionAiIdx : pruned.length;
+          oldestKeptImageIdx >= 0 && tailTokensFrom(oldestKeptImageIdx) < summarizeThreshold;
+        const motionTailFits =
+          hasMotion && tailTokensFrom(lastMotionAiIdx) < summarizeThreshold;
+        // The boundary with no frame in play: the last motion turn while its
+        // own tail fits, else the end of the history.
+        const motionOrEndIdx = motionTailFits ? lastMotionAiIdx : pruned.length;
         // The frame anchor only ever pulls the boundary EARLIER, and only from
         // a position whose tail is already proven under the threshold — so it
-        // cannot widen the tail past what rule 2's own tail-fits condition
-        // already allows.
+        // cannot widen the tail past what its tail-fits condition already
+        // allows.
+        const frameAnchorApplies = keptFrameTailFits && oldestKeptImageIdx < motionOrEndIdx;
+        // The lowest index the summarize step below will accept. At or under it
+        // the head is a single message or empty, and there is nothing to
+        // compress.
+        const guardFloorIdx = firstHumanIdx + 1;
+        // ONE case a tail-fits condition cannot cover, because it is not about
+        // the tail: pulling the boundary earlier can also put it AT or BELOW
+        // that floor, where nothing is summarized at all — so the history grows
+        // where the other anchor would have compressed it. The AG-UI ingest does
+        // not filter what a client sends, and a client-supplied system role or
+        // an image-bearing second message both land a frame low enough; no
+        // writer in this repo does, since frontendImageInjectionMiddleware
+        // appends after a ToolMessage and a rebuilt history puts the text-only
+        // summary at `firstHumanIdx + 1`.
         //
-        // ONE case that condition does not cover, because it is not about the
-        // tail: pulling the boundary earlier can also put it AT or BELOW the
-        // `boundaryIdx > firstHumanIdx + 1` guard on the summarize step further
-        // down, and there nothing is summarized at all — so the history grows
-        // where the motion boundary would have compressed it. Growth is bounded
-        // (once the frame's tail crosses the threshold this anchor drops out and
-        // behaviour reverts), but bounded by the uncounted prefix plus the
-        // threshold, and the prefix is the quantity the block above already
-        // flags as uncounted.
-        //
-        // No writer in this repo can reach it: frontendImageInjectionMiddleware
-        // appends after a ToolMessage, so the earliest an injected frame can sit
-        // is index 3, and a rebuilt history puts the text-only summary at
-        // `firstHumanIdx + 1`. The AG-UI ingest, however, does not filter what a
-        // client sends — a client-supplied system role, or an image-bearing
-        // second message, both land a frame low enough. Latent rather than live,
-        // and the reason this is documented rather than clamped: forcing the
-        // boundary above the guard would also change the frame-first history,
-        // where this rule and its predecessor currently agree byte for byte.
-        const anchoredOnKeptFrame = keptFrameTailFits && oldestKeptImageIdx < motionOrEndIdx;
-        const boundaryIdx = keptFrameTailFits
-          ? Math.min(motionOrEndIdx, oldestKeptImageIdx)
-          : motionOrEndIdx;
+        // So the frame anchor gives way here too, on the same terms as its
+        // tail-fits condition: it is dropped only when the boundary it would
+        // choose can summarize nothing AND the fallback can, which costs the
+        // frame exactly where no boundary that kept it could have compressed
+        // anything. Measured over 40 rounds at a 1000-token cap on both client
+        // routes, leaving it in place breaches the hard cap outright — 1059 and
+        // 1049 tokens — because the dead zone holds for as long as the frame's
+        // tail stays under the threshold.
+        const frameAnchorBelowGuard =
+          frameAnchorApplies &&
+          oldestKeptImageIdx <= guardFloorIdx &&
+          motionOrEndIdx > guardFloorIdx;
+        const anchoredOnKeptFrame = frameAnchorApplies && !frameAnchorBelowGuard;
+        const boundaryIdx = anchoredOnKeptFrame ? oldestKeptImageIdx : motionOrEndIdx;
         // Names which rule chose the boundary. Pinned by test: the label is the
         // only thing that says, from a log alone, which policy is in force on a
-        // live run — and the motion cases now split in two, so a log reading
-        // `last-motion` on a run that actually anchored on the frame would
-        // misreport precisely the branch this node added.
-        const anchorLabel = anchoredOnKeptFrame
+        // live run — so every branch that can move the boundary has to be
+        // distinguishable here, including the two ways an anchor drops out.
+        const baseAnchorLabel = anchoredOnKeptFrame
           ? hasMotion
             ? 'kept-frame-before-last-motion'
             : 'oldest-kept-frame'
-          : hasMotion
+          : motionTailFits
             ? 'last-motion'
-            : 'end-of-history (no frame worth holding back)';
+            : hasMotion
+              ? 'end-of-history (last motion tail over threshold)'
+              : 'end-of-history (no frame worth holding back)';
+        const anchorLabel = frameAnchorBelowGuard
+          ? `${baseAnchorLabel} (kept frame below the summarize guard)`
+          : baseAnchorLabel;
 
-        if (firstHumanIdx >= 0 && boundaryIdx > firstHumanIdx + 1) {
+        if (firstHumanIdx >= 0 && boundaryIdx > guardFloorIdx) {
           const headSlice = pruned.slice(firstHumanIdx + 1, boundaryIdx);
           const tail = pruned.slice(boundaryIdx);
           const firstHuman = pruned[firstHumanIdx];
@@ -631,7 +662,34 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
             ];
             summarized = true;
             finalTokens = estimateTokens(rebuilt, imageTokenBudget);
+            // This thread has demonstrably regained the ability to compress, so
+            // a later re-entry into the dead zone is news again rather than a
+            // repeat of a warning already given.
+            unsummarizableThreads.delete(threadId);
           }
+        } else if (!unsummarizableThreads.has(threadId)) {
+          // The degenerate case, and a real limit rather than a bug: every
+          // candidate boundary sits at or before the first human turn, so the
+          // head is a single message or empty and there is nothing to compress.
+          // What is over the threshold is the preserved prefix plus a tail that
+          // already fits, and neither is the summarizer's to shrink.
+          //
+          // It must not be SILENT. The summarize step's own line is only
+          // printed when it runs, so a session that is structurally unable to
+          // summarize looks exactly like one that has never needed to — which
+          // is how a middleware could sit out an entire session with nothing
+          // saying why. Once per thread, on `warn` so it does not read as
+          // routine turn-by-turn accounting, and re-armed above the moment a
+          // summary actually lands.
+          unsummarizableThreads.add(threadId);
+          console.warn(
+            `[context-pruner] thread=${threadId} CANNOT SUMMARIZE: ` +
+              `threshold crossed (pruned=${afterPruneTokens} ≥ ${summarizeThreshold}) ` +
+              `but every candidate boundary lands at or before the first human turn ` +
+              `(boundary=${boundaryIdx}, firstHuman=${firstHumanIdx}, ` +
+              `anchor=${anchorLabel}); nothing before it can be compressed, ` +
+              `so this history will keep growing. Reported once per thread.`
+          );
         }
       }
 
@@ -665,3 +723,9 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
 
 // Exposed for tests; do not call from app code.
 export const __inflightSummariesForTest = inflightSummaries;
+
+// Exposed for tests; do not call from app code. The whole test file shares one
+// thread id, so a suite that did not clear this between cases would have the
+// first test to reach the dead zone consume the once-per-thread warning and
+// every later one pass or fail by file order.
+export const __unsummarizableThreadsForTest = unsummarizableThreads;
