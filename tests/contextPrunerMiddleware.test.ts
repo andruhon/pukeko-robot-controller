@@ -2687,7 +2687,7 @@ describe('contextPrunerMiddleware — RC-60 an early motion call must not pin th
   // silent shape would leave these live.
 
   it('THE DEFECT (noisy): a motion at index 2 summarizes on most rounds and STILL passed the cap', async () => {
-    // Red before the fix: peak 60706 with the summarizer called on 40 of 60
+    // Red before the fix: peak 60715 with the summarizer called on 40 of 60
     // rounds. The boundary sits at 2 forever, so each round compresses a
     // one-message head and the tail behind it grows unchecked.
     const ROUNDS = 60
@@ -2714,7 +2714,7 @@ describe('contextPrunerMiddleware — RC-60 an early motion call must not pin th
     // The second noisy route, and not a restatement of the first: here the
     // motion is preceded by a complete capture turn, so the boundary sits at
     // index 4 rather than 2 and the kept frame is the motion composite rather
-    // than the capture one. Red before the fix at peak 60706 / 40 summaries.
+    // than the capture one. Red before the fix at peak 60715 / 40 summaries.
     const ROUNDS = 60
     const { peak, summaries } = await runSession(
       PRUNER_LOCAL,
