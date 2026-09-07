@@ -20,13 +20,24 @@ export interface RobotCapabilities {
   // world this means the media stream is flowing, not merely that the panel is
   // mounted — see worlds.ts, which is where the definition is stated.
   isReady(): boolean;
-  // RC-53: resolve once `isReady()` holds, or once a bounded deadline passes.
+  // RC-53: open ONE tool call's camera window. Resolves once `isReady()` holds
+  // or once a bounded deadline passes, and hands back the capture bound to that
+  // same deadline, so the two waits inside one call measure themselves against
+  // one instant instead of each starting a fresh budget.
+  //
   // Optional because the interpreter's contract is "ask, then act" and a
   // capability set with no startup window (every test fake, the HTTP snapshot
-  // source) has nothing to wait for. RobotSession awaits it before either gate
+  // source) has nothing to wait for. RobotSession opens one before either gate
   // so a tool call arriving during the camera's startup waits for the stream
   // instead of being refused for not having one yet.
-  whenReady?(): Promise<void>;
+  //
+  // It returns the capture rather than storing it because a deadline is
+  // per-CALL state and this object is per-APP: stored on the capabilities it
+  // would outlive the call that set it, leaving the next capture measuring
+  // itself against a window that closed, and a second call would overwrite the
+  // budget of one still in flight. A capture handed back is reachable only
+  // through the call that was given it.
+  beginCall?(): Promise<CallScopedCapabilities>;
   // May be synchronous (the mounted <PkWebcamPanel>, which draws off a canvas
   // it already has) or asynchronous (an HTTP-backed source, which must fetch
   // the frame). This mirrors vue-ui's own ImageCaptureSource, which allows
@@ -45,6 +56,14 @@ export interface RobotCapabilities {
 
 // The subset App.vue actually provides; RobotSession fills in robotUrl/robotHost.
 export type BrowserCapabilities = Omit<RobotCapabilities, 'robotUrl' | 'robotHost'>;
+
+// RC-53: what `beginCall` hands back — the part of the capability set that is
+// scoped to one tool call rather than to the app. Only the capture, because the
+// camera deadline is the only per-call thing there is. Deliberately the same
+// signature as RobotCapabilities' own, so vue-ui's zero-argument
+// ImageCaptureSource shape is still satisfied by the object RobotSession builds
+// for the call: the deadline travels in the closure, not in a parameter.
+export type CallScopedCapabilities = Pick<RobotCapabilities, 'captureFrame'>;
 
 // Parse a `{ mimeType, data }` image envelope out of a `data:` URL, or null if
 // the string isn't a well-formed base64 image data URL. Promoted verbatim into

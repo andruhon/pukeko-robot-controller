@@ -128,15 +128,23 @@ export class RobotSession {
   // It is bounded and never rejects, so a camera that really is unavailable
   // still reaches its gate and still fails there — only later, and for a reason
   // that is no longer "you asked too early".
-  private awaitCameraStartup(): Promise<void> {
-    return this.caps.whenReady?.() ?? Promise.resolve();
+  //
+  // What comes back is the capability set THIS call must use: `beginCall` hands
+  // over a capture bound to the deadline it just opened, so both waits inside
+  // one call measure themselves against one instant. Handing it over rather
+  // than storing it on the long-lived capabilities is what keeps the deadline
+  // per-call — the merged object below is a local of one call, dropped when
+  // that call returns OR throws, so a spent deadline cannot reach the next
+  // caller and two overlapping calls hold one budget each.
+  private async capsForCall(): Promise<RobotCapabilities> {
+    const scoped = await this.caps.beginCall?.();
+    return scoped ? { ...this.caps, ...scoped } : this.caps;
   }
 
   // Fulfil one client-side motion tool by running its recipe. Returns the JSON
   // string handed back to the model.
   async runMotion(def: RobotToolDef, args: unknown): Promise<string> {
-    await this.awaitCameraStartup();
-    return runRecipe(def, args, this.caps);
+    return runRecipe(def, args, await this.capsForCall());
   }
 
   // The generic single-frame capability (capture_image). PLAT-18: delegates to
@@ -145,8 +153,7 @@ export class RobotSession {
   // The envelope contract ({mimeType,data}/{error} + the exact error strings)
   // is frozen there (RC-14 renderers key on it).
   async captureImage(): Promise<string> {
-    await this.awaitCameraStartup();
-    return captureImageResult(this.caps);
+    return captureImageResult(await this.capsForCall());
   }
 
   // The AG-UI run-input tool declarations — the shared capture_image

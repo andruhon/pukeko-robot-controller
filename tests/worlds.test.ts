@@ -507,7 +507,14 @@ describe('RC-53 the real world is ready when its camera is streaming', () => {
     return makeStartingPanel({ blankFramesWhenLive: Number.POSITIVE_INFINITY })
   }
 
-  /** A real-world session over `panel`, plus the URLs its fetch was asked for. */
+  /**
+   * A real-world session over `panel`, the capabilities object behind it, and
+   * the URLs its fetch was asked for.
+   *
+   * The capabilities come back as well as the session because the seam and the
+   * direct capture are two different callers of the same object, and telling
+   * them apart is the whole point of the deadline-scope specs below.
+   */
   function realWorldSession(
     panel: ReturnType<typeof makeStartingPanel>,
     overrides?: { cameraReadyTimeoutMs?: number }
@@ -527,7 +534,7 @@ describe('RC-53 the real world is ready when its camera is streaming', () => {
       presetId: ACEBOTT_QD021_PRESET.id,
       capabilities,
     })
-    return { session, calls }
+    return { session, capabilities, calls }
   }
 
   it('waits for the camera on the MOTION path too, not only for capture_image', async () => {
@@ -561,8 +568,8 @@ describe('RC-53 the real world is ready when its camera is streaming', () => {
   })
 
   it('bounds a capture_image call by ONE deadline, not one per wait', async () => {
-    // The deadlines used to COMPOSE rather than bound: whenReady could spend
-    // the whole budget and the capture that followed started a fresh one.
+    // The deadlines used to COMPOSE rather than bound: the readiness wait could
+    // spend the whole budget and the capture that followed started a fresh one.
     // Measured at 181 ms against a configured 100 ms — just under 2x, and just
     // under 3x on the motion path below.
     //
@@ -603,8 +610,8 @@ describe('RC-53 the real world is ready when its camera is streaming', () => {
   })
 
   it('bounds a MOTION call by one deadline too, and names what expired', async () => {
-    // The 3x path: whenReady, the Before frame, the After frame, each formerly
-    // free to start a deadline of its own.
+    // The 3x path: the readiness wait, the Before frame, the After frame, each
+    // formerly free to start a deadline of its own.
     vi.useFakeTimers()
     try {
       const panel = makeNeverDecodingPanel()
@@ -714,6 +721,162 @@ describe('RC-53 the real world is ready when its camera is streaming', () => {
       await vi.advanceTimersByTimeAsync(20)
       expect(settled).toHaveLength(1)
       expect(JSON.parse(settled[0])).toEqual({ error: 'Webcam not initialized' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // --- the deadline belongs to ONE call --------------------------------------
+  //
+  // Sharing one deadline between the two waits of a call is the fix above. The
+  // two specs here hold the other half of it: the deadline is scoped to the
+  // call that opened it. Both use ONE capabilities object, because that is the
+  // object App.vue builds once for the app's lifetime and every session reuses
+  // — a spec that builds a fresh one per call cannot see either failure.
+
+  it('does not leave a spent deadline behind for the next capture', async () => {
+    // The trap a per-app deadline lays. A capabilities object outlives every
+    // call made through it, so a deadline stored on it is a permanently-past
+    // instant the moment the first call ends: the next capture measures itself
+    // against a window that closed, takes a single attempt and reports no
+    // frame — for a camera that is streaming perfectly well.
+    //
+    // Real timers, and a first call that genuinely EXHAUSTS its budget rather
+    // than one that succeeds: a first call that finished early would leave a
+    // stored deadline still in the future, and this spec would pass over the
+    // defect it exists to catch.
+    const panel = makeStartingPanel({ blankFramesWhenLive: 3 })
+    const { session, capabilities } = realWorldSession(panel, { cameraReadyTimeoutMs: 50 })
+
+    // Call one: the camera never comes up, so the wait spends the whole 50 ms
+    // and the call fails at its gate without ever reaching a capture.
+    expect(JSON.parse(await session.captureImage())).toEqual({ error: 'Webcam not initialized' })
+    expect(panel.captureFrame).not.toHaveBeenCalled()
+
+    // The camera comes up afterwards — the student pressed Retry, or the
+    // sensor finally finished spinning up.
+    panel.isActive = true
+
+    // A capture issued now is a NEW piece of work and gets a budget of its own:
+    // three undecodable frames polled through, then the real one. This is the
+    // same assertion the fresh-object spec above makes, on an object that has
+    // already served a call.
+    expect(await capabilities.captureFrame()).toBe(LIVE_FRAME)
+    expect(panel.captureFrame).toHaveBeenCalledTimes(4)
+  })
+
+  it('gives two overlapping calls a budget each, not one they share', async () => {
+    // The second consequence of storing the deadline: a later call overwrites
+    // the budget of one still in flight. The first call then runs on past its
+    // own deadline to the second call's — measured at 161 ms against 100 ms —
+    // so "one deadline per tool call" would hold only while calls are
+    // serialised, and nothing serialises them.
+    vi.useFakeTimers()
+    try {
+      const panel = makeNeverDecodingPanel()
+      const { session } = realWorldSession(panel, { cameraReadyTimeoutMs: 100 })
+      // Live at 80 ms, decoding never: the only shape that reaches the second
+      // wait, so both calls are still inside their captures when they overlap.
+      setTimeout(() => {
+        panel.isActive = true
+      }, 80)
+
+      const first: string[] = []
+      const second: string[] = []
+      void session.captureImage().then((r) => {
+        first.push(r)
+      })
+      // A second call opens 60 ms in, while the first is still waiting. Its own
+      // deadline therefore falls at 160 ms — 60 ms past the first call's.
+      setTimeout(() => {
+        void session.captureImage().then((r) => {
+          second.push(r)
+        })
+      }, 60)
+
+      await vi.advanceTimersByTimeAsync(130)
+      // The first call is 30 ms past its own deadline and must have answered.
+      expect(first).toHaveLength(1)
+      expect(JSON.parse(first[0])).toEqual({
+        error: 'Failed to capture frame. Is the camera active?',
+      })
+      // ...and the second is still inside its own, which started 60 ms later.
+      // Without this the spec would only say the first call was fast, not that
+      // the two budgets are separate.
+      expect(second).toEqual([])
+
+      await vi.advanceTimersByTimeAsync(50)
+      expect(second).toHaveLength(1)
+      expect(JSON.parse(second[0])).toEqual({
+        error: 'Failed to capture frame. Is the camera active?',
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('names the AFTER frame when that is the capture that failed', async () => {
+    // The other message on the motion path, and the one a control mutation
+    // showed was unasserted: the suite stayed green while this string said
+    // something else entirely. It is pinned here verbatim so it cannot drift
+    // unnoticed. The wording itself is a candidate for the vue-ui-boundary
+    // node, not for this spec to pre-empt.
+    //
+    // Reaching it needs a call where the Before frame lands, the walk happens,
+    // and the camera has stopped producing usable frames by the time the After
+    // frame is taken — which is why the panel yields exactly one good frame.
+    vi.useFakeTimers()
+    try {
+      let goodFramesLeft = 1
+      const panel = {
+        isActive: true,
+        // 'data:,' is what a 0x0 canvas serialises to: truthy, and not an image.
+        captureFrame: vi.fn(() => (goodFramesLeft-- > 0 ? LIVE_FRAME : 'data:,')),
+        composeBeforeAfter: vi.fn(
+          async (_b: string, _a: string) => 'data:image/jpeg;base64,COMPOSITEBYTES'
+        ),
+      }
+      const calls: string[] = []
+      const slowFetch = vi.fn(async (input: RequestInfo | URL) => {
+        calls.push(String(input))
+        // Each leg outlasts the whole camera deadline, so the After frame is
+        // taken well after the call's window has closed and gets its one shot.
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        return { ok: true, status: 200, text: async () => 'ok' } as unknown as Response
+      })
+      const capabilities = createWorldCapabilities({
+        getWorldId: () => 'real',
+        hosts: HOSTS,
+        getWebcamPanel: () => panel,
+        fetch: slowFetch as unknown as typeof fetch,
+        cameraReadyPollMs: 1,
+        cameraReadyTimeoutMs: 100,
+      })
+      const session = createWorldSession({
+        worldId: 'real',
+        hosts: HOSTS,
+        presetId: ACEBOTT_QD021_PRESET.id,
+        capabilities,
+      })
+
+      const settled: string[] = []
+      void session.clientToolHandlers.move_forward({}).then((r) => {
+        settled.push(r)
+      })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      expect(settled).toHaveLength(1)
+      expect(JSON.parse(settled[0])).toEqual({
+        error: 'Failed to capture After frame.',
+        motion: 'move_forward',
+      })
+      // It really was the AFTER frame: the Before frame was taken and the robot
+      // was driven before the failure, so this is not the Before-frame message
+      // arriving under another name.
+      expect(calls).toEqual(['http://10.0.0.7/forward', 'http://10.0.0.7/stop'])
+      expect(panel.captureFrame).toHaveBeenCalledTimes(2)
+      expect(panel.composeBeforeAfter).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
     }

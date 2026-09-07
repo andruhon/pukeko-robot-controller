@@ -17,7 +17,7 @@ import {
   type ImageCaptureSource,
 } from '@galvanized-pukeko/vue-ui';
 import { RobotSession, type RobotSessionOptions } from './RobotSession.js';
-import type { BrowserCapabilities } from './interpreter.js';
+import type { BrowserCapabilities, CallScopedCapabilities } from './interpreter.js';
 
 /** The real Acebott biped on its access point. */
 export const REAL_ROBOT_WORLD_ID = 'real';
@@ -59,7 +59,7 @@ export const CAPTURE_PATH = '/capture';
 /**
  * RC-53. How long ONE client tool call waits for the real world's camera to
  * start producing frames before it reports a failure. It is the budget for the
- * whole call, not for each wait inside it — see `whenReady` below.
+ * whole call, not for each wait inside it — see `beginCall` below.
  *
  * Selecting the real world mounts the panel synchronously, but neither the
  * panel's `getUserMedia` call nor the video element's first decoded frame is
@@ -240,7 +240,7 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
   // told the camera was inactive when it was merely starting.
   //
   // The capture path agrees with this definition rather than merely being
-  // guarded by it: `whenReady` below lets a caller wait for the stream instead
+  // guarded by it: `beginCall` below lets a caller wait for the stream instead
   // of being refused, and `captureRealFrame` waits again for a frame that
   // actually decodes. The two share one deadline per tool call, so a camera
   // that is genuinely absent still fails, and fails for that reason.
@@ -272,61 +272,72 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
     }
   }
 
-  // RC-53 — ONE DEADLINE PER TOOL CALL, opened at the seam.
-  //
-  // `whenReady` records the instant the current call runs out of patience, and
-  // the capture that follows measures itself against that same instant instead
-  // of starting a fresh deadline of its own.
-  //
-  // Without that the deadlines COMPOSE rather than bound. `whenReady` can spend
-  // the entire budget waiting for the stream, and a capture that then started
-  // its own would put `capture_image` at just under 2x the configured value and
-  // a motion recipe — the wait, the Before frame, the After frame — at just
-  // under 3x. A documented 5 s deadline that can take 15 s is not a deadline,
-  // and the model is the one left holding the wait.
-  //
-  // What this enforces is exactly "one call through RobotSession's seam", which
-  // awaits `whenReady()` before either gate. A capture reached WITHOUT the seam
-  // finds no window open and gets a fresh deadline — the behaviour it had
-  // before, and what a direct `captureFrame()` call still sees.
-  //
-  // Every wait still attempts at least once, so the After frame of a long
-  // motion takes its shot against a camera that is by then streaming, even
-  // though the window closed while the robot was walking. What sharing costs is
-  // the right to keep RETRYING past the call's own deadline, which is the thing
-  // that was never bounded.
-  let callDeadline: number | null = null;
-
-  /**
-   * Resolve once readiness holds, or once the call's deadline passes — never
-   * reject. Callers gate on `isReady()` afterwards, so a timeout surfaces as
-   * the ordinary not-ready failure rather than as a thrown run error.
-   */
-  async function whenReady(): Promise<void> {
-    callDeadline = Date.now() + readyTimeoutMs;
-    await pollUntil(callDeadline, () => (isReady() ? true : null));
-  }
-
   /**
    * The real world's frame: the first one the panel produces that actually
-   * decodes, or null once the call's deadline passes. See `decodableFrame` for
-   * why a live stream is not on its own enough.
+   * decodes, or null once `deadline` passes. See `decodableFrame` for why a
+   * live stream is not on its own enough.
    */
-  async function captureRealFrame(): Promise<string | null> {
-    return pollUntil(callDeadline ?? Date.now() + readyTimeoutMs, () => {
+  async function captureRealFrame(deadline: number): Promise<string | null> {
+    return pollUntil(deadline, () => {
       const panel = deps.getWebcamPanel();
       if (panel == null || !panel.isActive) return null;
       return decodableFrame(panel);
     });
   }
 
+  /** One capture, dispatched on the CURRENT world and bounded by `deadline`. */
+  function captureFrameBy(deadline: number): Promise<string | null> {
+    if (deps.getWorldId() === SIMULATED_WORLD_ID) return captureSimulatedFrame();
+    return captureRealFrame(deadline);
+  }
+
+  // RC-53 — ONE DEADLINE PER TOOL CALL, opened at the seam.
+  //
+  // `beginCall` fixes the instant the current call runs out of patience, waits
+  // for readiness against it, and hands back the capture that measures itself
+  // against that same instant instead of starting a fresh deadline of its own.
+  //
+  // Without that the deadlines COMPOSE rather than bound. The readiness wait
+  // can spend the entire budget, and a capture that then started its own would
+  // put `capture_image` at just under 2x the configured value and a motion
+  // recipe — the wait, the Before frame, the After frame — at just under 3x. A
+  // documented 5 s deadline that can take 15 s is not a deadline, and the model
+  // is the one left holding the wait.
+  //
+  // The deadline is a LOCAL of this function's invocation, reachable only
+  // through the capture handed back to the caller. It is stored nowhere, so it
+  // cannot outlive the call that opened it on any path — the throwing one
+  // included, since there is no slot left holding it — and two overlapping
+  // calls own one deadline each rather than the later one overwriting the
+  // earlier. That is the difference between "one deadline per tool call" and
+  // "one deadline at a time", and it is the first that `isReady`'s comment
+  // above claims.
+  //
+  // What this bounds is exactly one call through RobotSession's seam, which
+  // opens the window before either gate and uses the capture it was handed for
+  // the rest of the call. A capture reached WITHOUT the seam has no call to
+  // belong to, so it computes a fresh deadline of its own — the behaviour it
+  // had before, and what a direct `captureFrame()` call still sees.
+  //
+  // Every wait still attempts at least once, so the After frame of a long
+  // motion takes its shot against a camera that is by then streaming, even
+  // though the window closed while the robot was walking. What sharing costs is
+  // the right to keep RETRYING past the call's own deadline, which is the thing
+  // that was never bounded.
+  //
+  // Never rejects. Callers gate on `isReady()` after it resolves, so a timeout
+  // surfaces as the ordinary not-ready failure rather than as a thrown run
+  // error.
+  async function beginCall(): Promise<CallScopedCapabilities> {
+    const deadline = Date.now() + readyTimeoutMs;
+    await pollUntil(deadline, () => (isReady() ? true : null));
+    return { captureFrame: () => captureFrameBy(deadline) };
+  }
+
   return {
     isReady,
-    whenReady,
-    captureFrame: () => {
-      if (deps.getWorldId() === SIMULATED_WORLD_ID) return captureSimulatedFrame();
-      return captureRealFrame();
-    },
+    beginCall,
+    captureFrame: () => captureFrameBy(Date.now() + readyTimeoutMs),
     composeBeforeAfter: (before, after) =>
       deps.getWebcamPanel()?.composeBeforeAfter(before, after) ?? Promise.resolve(null),
     fetch: deps.fetch,

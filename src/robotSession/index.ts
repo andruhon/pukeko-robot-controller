@@ -7,6 +7,7 @@ export {
   coerceSteps,
   type RobotCapabilities,
   type BrowserCapabilities,
+  type CallScopedCapabilities,
 } from './interpreter.js';
 export {
   REAL_ROBOT_WORLD_ID,
