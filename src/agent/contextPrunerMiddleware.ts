@@ -253,9 +253,15 @@ interface PruneStats {
 // `keptImageIdx` is the prune's own answer to "which image-bearing turns did I
 // elect to keep", newest-first, as indices into the RETURNED array. It is
 // returned rather than recomputed by the caller because the summarize boundary
-// depends on it: two independent answers to that question would drift, and two
-// mechanisms disagreeing about which frames matter is precisely the defect the
-// boundary rule below exists to close.
+// depends on it. Note what the argument is NOT: recomputing it at the summarize
+// site gives the same answer today, because the strip has already cleared the
+// image blocks of every non-kept turn, so the two cannot currently disagree.
+// The point is that the agreement rests on a coupling inside this function that
+// is invisible from the call site and that nobody has written down as an
+// invariant. Returning the indices removes the dependency on it, rather than
+// fixing a drift that exists — two mechanisms disagreeing about which frames
+// matter is the defect the boundary rule below exists to close, and this keeps
+// the question from having a second answer at all.
 //
 // The indices stay valid because every step here is a `map` — messages are
 // copied in place, never inserted or removed, so position is preserved.
@@ -458,9 +464,23 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
         // cap at round 58 and reached 62021 tokens while firing the summarizer
         // on 80 of 120 turns: RC-27's own unbounded-growth defect, reintroduced
         // by the anchor meant to fix a different one. Falling through to rule 3
-        // there keeps the guarantee that every rebuild lands under the
-        // threshold, and it costs the frame only in the shape where no bounded
-        // boundary could have kept it.
+        // there is what keeps the summarize step making real progress, and it
+        // costs the frame only in the shape where no bounded boundary could
+        // have kept it.
+        //
+        // Be precise about WHAT is bounded, because it is not the whole
+        // rebuild: the condition is checked on the tail alone. The rebuild is
+        // the preserved prefix, plus the summary message, plus that tail, and
+        // neither of the first two is counted. So a rebuild lands slightly over
+        // the threshold as a matter of course — 21053 against a 21000 threshold
+        // for a 200-character opening instruction — and a large enough prefix
+        // can carry it past the hard cap outright: a 36000-character first
+        // message reaches 30003, and a SystemMessage in `state.messages`
+        // reaches 31060. Neither is how this agent runs in production, where
+        // the system prompt goes to `createAgent` as `systemPrompt` and the
+        // preserved prefix is the operator's opening instruction alone. Counting
+        // the prefix into the condition is a one-expression change if that ever
+        // stops being true.
         //
         // Orphan safety, in all three cases: a tool call is never summarized
         // away from its result. The injected image HumanMessage always sits
