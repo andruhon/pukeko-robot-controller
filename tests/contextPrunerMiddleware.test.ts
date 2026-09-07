@@ -3088,7 +3088,10 @@ describe('contextPrunerMiddleware — RC-60 an early motion call must not pin th
     // log still reads `last-motion` would misreport exactly the change this
     // node made.
 
-    // Rule 1 dropped out: its own tail is over the threshold.
+    // Rule 1 dropped out: its own tail is over the threshold. The motion turn
+    // carries a frame, and its tail is over the threshold too, so RC-59's label
+    // names both candidates rather than only the motion — same history, same
+    // boundary, a second clause the old label left unsaid.
     const earlyMotion: BaseMessage[] = [
       new HumanMessage({ id: 'h-user', content: 'Drive once, then answer.' }),
       ...motionTurn(0),
@@ -3097,7 +3100,7 @@ describe('contextPrunerMiddleware — RC-60 an early motion call must not pin th
       earlyMotion.push(new AIMessage({ id: `ai-answer-${i}`, content: 'A'.repeat(400) }))
     }
     expect(await anchorLabelFor(earlyMotion)).toBe(
-      'end-of-history (last motion tail over threshold)'
+      'end-of-history (last motion tail over threshold and kept frame tail over threshold)'
     )
 
     // Rule 2 dropped out: the frame it would anchor on sits on the guard floor,
@@ -3159,5 +3162,265 @@ describe('contextPrunerMiddleware — RC-60 an early motion call must not pin th
     expect(anchorLabels.length).toBeGreaterThan(0)
     expect([...new Set(anchorLabels)]).toEqual(['last-motion'])
     expect(warnings).toEqual([])
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────────────
+// RC-59 — the `anchor=` label and the CANNOT SUMMARIZE warning named causes
+// they did not determine.
+//
+// One defect, four times: each string was composed from a condition that used
+// to decide what it asserts and stopped doing so when a later change added a
+// second way for the same outcome to arise. The boundary chosen was right every
+// time, which is why nothing went red and why each instance was found by
+// someone measuring something else.
+//
+// The consumer is an operator reading a live log and asking why a frame
+// disappeared or why nothing is being compressed. "Nothing was captured" points
+// at the capture path; "the frame was dropped because its tail was too big"
+// points at verbosity and thresholds and means the camera worked. Sending
+// someone to debug a camera that worked is the cost.
+//
+// These cells assert strings, which is exactly the shape that passes for the
+// wrong reason — so each fixture also pins the premise that puts it on the
+// branch it claims to exercise, and each label is a distinct literal in the
+// source so that mutating one cannot red another.
+//
+// Message classes are compared by reference or `getType()`, never `instanceof`:
+// this repo resolves two copies of @langchain/core.
+// ───────────────────────────────────────────────────────────────────────────
+describe('contextPrunerMiddleware — RC-59 the anchor label names the cause that fired', () => {
+  const OVER_THRESHOLD = {
+    maxContextTokens: 1000,
+    summarizeAtFraction: 0.5,
+    imageTokenBudget: 50,
+  } as const
+
+  function captureResultJson(dataLen = 400): string {
+    return JSON.stringify({ mimeType: 'image/jpeg', data: 'X'.repeat(dataLen), captured: true })
+  }
+
+  // One driver for all four cells: the label off the summarize line, the
+  // warnings off `console.warn`, and the stub itself, so a cell can pin WHICH
+  // branch it landed on rather than only what was printed.
+  async function anchorRunFor(messages: BaseMessage[], opts = {}) {
+    const llm = makeStubLlm()
+    const mw = createContextPrunerMiddleware({
+      llm,
+      ...OVER_THRESHOLD,
+      ...opts,
+    }) as HookContainer
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await getHook(mw.beforeModel)({ messages }, runtime)
+      const line = logSpy.mock.calls.map((c) => String(c[0])).find((l) => l.includes('anchor='))
+      return {
+        label: line ? (line.match(/anchor=([^;]*)/)?.[1] ?? '') : '',
+        warned: warnSpy.mock.calls.map((c) => String(c[0])),
+        llm,
+      }
+    } finally {
+      logSpy.mockRestore()
+      warnSpy.mockRestore()
+    }
+  }
+
+  it('INSTANCE 1: a frame dropped for an over-threshold tail is not reported as no frame at all', async () => {
+    // `end-of-history (no frame worth holding back)` was selected on
+    // `!hasMotion && !keptFrameTailFits`, and that is false in two structurally
+    // different ways. The second is not an edge: it is the exact case RC-27's
+    // tail-fits condition exists to produce, so the label was at its most
+    // misleading precisely when the mechanism it describes was doing its most
+    // important work.
+    //
+    // A frame exists, the mechanical strip kept it, and the boundary walked
+    // past it anyway because anchoring there would leave an unbounded tail.
+    const withFrame: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'Look once, then answer.' }),
+      new AIMessage({
+        id: 'ai-capture-0',
+        content: '',
+        tool_calls: [{ name: 'capture_image', args: {}, id: 'tc-cap-0' }],
+      }),
+      new ToolMessage({
+        id: 'tm-cap-0',
+        content: captureResultJson(),
+        tool_call_id: 'tc-cap-0',
+        name: 'capture_image',
+      }),
+      new HumanMessage({
+        id: 'h-frame-0',
+        content: [{ type: 'text', text: 'Frame 0.' }, imageBlock()],
+      }),
+    ]
+    for (let i = 0; i < 12; i++) {
+      withFrame.push(new AIMessage({ id: `ai-answer-${i}`, content: 'A'.repeat(400) }))
+    }
+    // The premise: there really is a kept frame here, and no motion call — so
+    // this is the same branch the frameless history below takes, reached the
+    // other way.
+    expect(withFrame.some((m) => isMotionToolCall(m))).toBe(false)
+    expect(withFrame.findIndex((m) => m.id === 'h-frame-0')).toBe(3)
+
+    const kept = await anchorRunFor(withFrame)
+    expect(kept.llm.invoke).toHaveBeenCalledTimes(1)
+    expect(kept.label).toBe('end-of-history (kept frame tail over threshold)')
+
+    // The pair. The frameless route keeps the label it always had, and the two
+    // are now tellable apart from the log line alone — which is the whole point
+    // of the field.
+    const frameless: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'Explain.' }),
+    ]
+    for (let i = 0; i < 12; i++) {
+      frameless.push(new AIMessage({ id: `ai-${i}`, content: 'A'.repeat(400) }))
+    }
+    const none = await anchorRunFor(frameless)
+    expect(none.llm.invoke).toHaveBeenCalledTimes(1)
+    expect(none.label).toBe('end-of-history (no frame worth holding back)')
+    expect(none.label).not.toBe(kept.label)
+  })
+
+  it('INSTANCE 2: a frame anchoring AFTER a dropped-out motion is not called kept-frame-before-last-motion', async () => {
+    // The one RC-60 made reachable, and it reaches the default AG-UI client.
+    // When `motionTailFits` is false, `motionOrEndIdx` becomes `pruned.length`,
+    // so `frameAnchorApplies`' test `oldestKeptImageIdx < motionOrEndIdx` is
+    // satisfied by ANY frame. `hasMotion` was a correct discriminator only
+    // while `motionOrEndIdx` was pinned to the motion; the discriminator the
+    // label needs is `motionTailFits`.
+    //
+    // The shape is the measured one: motion at index 1, frame at index 65. The
+    // motion failed, so frontendImageInjectionMiddleware pushed a text-only
+    // note and the frame arrives 62 talking turns later.
+    const messages: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'Drive once, then talk to me.' }),
+      new AIMessage({
+        id: 'ai-motion-0',
+        content: '',
+        tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'tc-mv-0' }],
+      }),
+      new ToolMessage({
+        id: 'tm-motion-0',
+        content: JSON.stringify({ error: 'robot unreachable' }),
+        tool_call_id: 'tc-mv-0',
+        name: 'move_forward',
+        status: 'error',
+      }),
+      new HumanMessage({
+        id: 'h-fail-0',
+        content: 'Motion (move_forward) failed: robot unreachable',
+      }),
+    ]
+    for (let i = 0; i < 61; i++) {
+      messages.push(new AIMessage({ id: `ai-talk-${i}`, content: 'A'.repeat(400) }))
+    }
+    messages.push(
+      new HumanMessage({
+        id: 'h-frame-late',
+        content: [{ type: 'text', text: 'Before/After frames.' }, imageBlock()],
+      })
+    )
+
+    // The premise, asserted rather than assumed: without these indices the
+    // fixture would not exercise the branch at all.
+    expect(messages.findIndex((m) => isMotionToolCall(m))).toBe(1)
+    expect(messages.findIndex((m) => m.id === 'h-frame-late')).toBe(65)
+
+    const run = await anchorRunFor(messages)
+    // It really did summarize, and it really did anchor on the frame — this is
+    // not the under-threshold path or the guard branch arriving at a label by
+    // another route.
+    expect(run.llm.invoke).toHaveBeenCalledTimes(1)
+    expect(run.warned).toEqual([])
+    expect(run.label).toBe('oldest-kept-frame (last motion tail over threshold)')
+    // The specific false statement this instance is: the frame is 64 messages
+    // AFTER the motion, so nothing may describe it as preceding one.
+    expect(run.label).not.toContain('before-last-motion')
+  })
+
+  it('INSTANCE 3: no composed label asserts there was no frame and then names the kept frame', async () => {
+    // `frameAnchorBelowGuard` forces `anchoredOnKeptFrame` false, so the base
+    // label took the else branch — and with no motion the whole string read
+    // `end-of-history (no frame worth holding back) (kept frame below the
+    // summarize guard)`. One clause said no frame was worth holding back; the
+    // next named the kept frame that was.
+    //
+    // A large opening instruction crosses the threshold on its own and an
+    // image-bearing second message sits exactly on the guard floor, with a tail
+    // small enough to fit — the client route RC-60 measured, with no motion.
+    const messages: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'U'.repeat(2000) }),
+      new HumanMessage({
+        id: 'h-frame-0',
+        content: [{ type: 'text', text: 'Here is what I see.' }, imageBlock()],
+      }),
+      new AIMessage({ id: 'ai-say-0', content: 'Still stuck here.' }),
+    ]
+    // The premise: no motion anywhere, and the frame is at the guard floor
+    // (`firstHumanIdx + 1` === 1).
+    expect(messages.some((m) => isMotionToolCall(m))).toBe(false)
+    expect(messages.findIndex((m) => m.id === 'h-frame-0')).toBe(1)
+
+    const run = await anchorRunFor(messages)
+    expect(run.llm.invoke).toHaveBeenCalledTimes(1)
+    expect(run.label).toBe('end-of-history (kept frame below the summarize guard)')
+    // The contradiction, stated as the thing that must not come back: the two
+    // clauses cannot both appear, whatever either is reworded to.
+    expect(run.label).not.toContain('no frame worth holding back')
+  })
+
+  it('INSTANCE 4: the CANNOT SUMMARIZE warning names the conjunct that actually failed', async () => {
+    // The warning is the `else if` of `firstHumanIdx >= 0 && boundaryIdx >
+    // guardFloorIdx`, so it fires when EITHER conjunct fails and its text named
+    // only the second. With no HumanMessage anywhere, `firstHumanIdx` is -1 and
+    // the boundary is nowhere near the guard floor — the sentence was
+    // contradicted by the `firstHuman=-1` printed beside it.
+    const noHuman: BaseMessage[] = [
+      new SystemMessage({ id: 'sys', content: 'S'.repeat(4000) }),
+      new AIMessage({ id: 'ai-0', content: 'Thinking.' }),
+      new AIMessage({ id: 'ai-1', content: 'Still thinking.' }),
+    ]
+    expect(noHuman.some((m) => isHumanMessage(m))).toBe(false)
+
+    const missing = await anchorRunFor(noHuman)
+    // The guard branch, not the summarize path: nothing was compressed.
+    expect(missing.llm.invoke).not.toHaveBeenCalled()
+    expect(missing.warned).toHaveLength(1)
+    expect(missing.warned[0]).toContain('CANNOT SUMMARIZE')
+    expect(missing.warned[0]).toContain('firstHuman=-1')
+    expect(missing.warned[0]).toContain('the history has no human turn to anchor a head against')
+    // The false sentence, named so it cannot come back.
+    expect(missing.warned[0]).not.toContain(
+      'every candidate boundary lands at or before the first human turn'
+    )
+
+    // The pair. The warning is once per thread and the whole file shares one
+    // thread id, so the second route needs the set re-armed — otherwise this
+    // half would silently assert nothing.
+    __unsummarizableThreadsForTest.clear()
+
+    const atTheGuard: BaseMessage[] = [
+      new HumanMessage({ id: 'h-user', content: 'U'.repeat(4000) }),
+      new AIMessage({
+        id: 'ai-motion-0',
+        content: '',
+        tool_calls: [{ name: 'move_forward', args: { steps: 2 }, id: 'tc-mv-0' }],
+      }),
+      new ToolMessage({
+        id: 'tm-motion-0',
+        content: JSON.stringify({ ok: true }),
+        tool_call_id: 'tc-mv-0',
+        name: 'move_forward',
+      }),
+    ]
+    const clamped = await anchorRunFor(atTheGuard)
+    expect(clamped.llm.invoke).not.toHaveBeenCalled()
+    expect(clamped.warned).toHaveLength(1)
+    expect(clamped.warned[0]).toContain('firstHuman=0')
+    expect(clamped.warned[0]).toContain(
+      'every candidate boundary lands at or before the first human turn'
+    )
+    expect(clamped.warned[0]).not.toContain('no human turn to anchor a head against')
   })
 })
