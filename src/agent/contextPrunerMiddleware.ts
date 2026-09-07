@@ -524,7 +524,28 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
         const motionOrEndIdx = hasMotion ? lastMotionAiIdx : pruned.length;
         // The frame anchor only ever pulls the boundary EARLIER, and only from
         // a position whose tail is already proven under the threshold — so it
-        // cannot widen the tail past what rule 3's condition already allows.
+        // cannot widen the tail past what rule 2's own tail-fits condition
+        // already allows.
+        //
+        // ONE case that condition does not cover, because it is not about the
+        // tail: pulling the boundary earlier can also put it AT or BELOW the
+        // `boundaryIdx > firstHumanIdx + 1` guard on the summarize step further
+        // down, and there nothing is summarized at all — so the history grows
+        // where the motion boundary would have compressed it. Growth is bounded
+        // (once the frame's tail crosses the threshold this anchor drops out and
+        // behaviour reverts), but bounded by the uncounted prefix plus the
+        // threshold, and the prefix is the quantity the block above already
+        // flags as uncounted.
+        //
+        // No writer in this repo can reach it: frontendImageInjectionMiddleware
+        // appends after a ToolMessage, so the earliest an injected frame can sit
+        // is index 3, and a rebuilt history puts the text-only summary at
+        // `firstHumanIdx + 1`. The AG-UI ingest, however, does not filter what a
+        // client sends — a client-supplied system role, or an image-bearing
+        // second message, both land a frame low enough. Latent rather than live,
+        // and the reason this is documented rather than clamped: forcing the
+        // boundary above the guard would also change the frame-first history,
+        // where this rule and its predecessor currently agree byte for byte.
         const anchoredOnKeptFrame = keptFrameTailFits && oldestKeptImageIdx < motionOrEndIdx;
         const boundaryIdx = keptFrameTailFits
           ? Math.min(motionOrEndIdx, oldestKeptImageIdx)
