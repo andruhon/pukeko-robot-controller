@@ -393,6 +393,115 @@ async function runSummary(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// The strings the log lines are composed from
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Which rule chose the boundary, and why each candidate that did not win dropped
+ * out. Pinned by test: the label is the only thing that says, from a log alone,
+ * which policy is in force on a live run — so every branch that can move the
+ * boundary has to be distinguishable here, including each way an anchor drops
+ * out.
+ *
+ * Every clause below is true on the branch that emits it, standing on its own,
+ * and that is the property this has to keep rather than a matter of wording. A
+ * clause APPENDED to a base chosen under the opposite assumption is what
+ * produced a single string asserting that no frame was worth holding back and
+ * then naming the kept frame that was — so the guard clause is selected here
+ * rather than suffixed.
+ *
+ * Lifted out of the middleware body so the no-punctuation rule below can be
+ * driven over the whole label set rather than over whichever labels a fixture
+ * happens to reach: a newly added label is covered the moment it exists. The
+ * branches are otherwise unchanged, and every label is still a distinct literal
+ * so that mutating one cannot red another.
+ */
+export function composeAnchorLabel(input: {
+  anchoredOnKeptFrame: boolean;
+  motionTailFits: boolean;
+  hasMotion: boolean;
+  frameAnchorBelowGuard: boolean;
+  hasKeptFrame: boolean;
+}): string {
+  const { anchoredOnKeptFrame, motionTailFits, hasMotion, frameAnchorBelowGuard, hasKeptFrame } =
+    input;
+  if (anchoredOnKeptFrame) {
+    // The frame won. Whether it precedes the last motion is decided by
+    // `motionTailFits`, NOT by `hasMotion`: once the motion anchor drops
+    // out, `motionOrEndIdx` is the end of the history, so
+    // `frameAnchorApplies` is satisfied by a frame ANYWHERE — including
+    // one far after the last motion, which is the shape a measured run
+    // hit at motion index 1 and frame index 65.
+    return motionTailFits
+      ? 'kept-frame-before-last-motion'
+      : hasMotion
+        ? 'oldest-kept-frame (last motion tail over threshold)'
+        : 'oldest-kept-frame';
+  }
+  if (motionTailFits) {
+    return frameAnchorBelowGuard
+      ? 'last-motion (kept frame below the summarize guard)'
+      : 'last-motion';
+  }
+  // Nothing was held back: the boundary is the end of the history.
+  // Name why each candidate dropped out, motion first.
+  //
+  // The frame arm is exhaustive by construction, so the parenthetical
+  // can never come out empty: `motionOrEndIdx` is `pruned.length`
+  // here, so `oldestKeptImageIdx < motionOrEndIdx` holds for every
+  // real index and `frameAnchorApplies` reduces to `keptFrameTailFits`
+  // — which is therefore false whenever the frame is not below the
+  // guard, i.e. whenever a frame exists its tail is the reason.
+  //
+  // The reasons are joined on a word, never on punctuation: the label
+  // is embedded in two lines that already use punctuation to delimit
+  // their own fields — a semicolon between fields on the summarize
+  // line, commas inside the warning's `(boundary=…, firstHuman=…,
+  // anchor=…)` — so either character inside the label truncates it for
+  // anything reading those fields. Pinned as a property over this whole
+  // set rather than left to exact-string equality to catch by accident.
+  const reasons: string[] = [];
+  if (hasMotion) reasons.push('last motion tail over threshold');
+  if (frameAnchorBelowGuard) {
+    reasons.push('kept frame below the summarize guard');
+  } else if (hasKeptFrame) {
+    reasons.push('kept frame tail over threshold');
+  } else {
+    reasons.push('no frame worth holding back');
+  }
+  return `end-of-history (${reasons.join(' and ')})`;
+}
+
+/**
+ * Why the summarize step could not run. TWO conditions gate it and either one
+ * can be the one that failed, so the warning names the one that actually did.
+ *
+ * Both clauses are embedded between the warning's own delimiters, so the same
+ * no-punctuation rule that binds the anchor label binds these: neither may
+ * contain a `;` or a `,`.
+ */
+export const CANNOT_SUMMARIZE_CAUSES = {
+  /** `firstHumanIdx < 0` — the first conjunct failed. */
+  noHumanTurn: 'the history has no human turn to anchor a head against',
+  /**
+   * `boundaryIdx <= guardFloorIdx` — the second conjunct failed.
+   *
+   * Says what the predicate actually tests. `guardFloorIdx` is
+   * `firstHumanIdx + 1`, so the failing comparison admits a boundary landing
+   * one message AFTER the first human turn — where the head slice
+   * `(firstHumanIdx + 1 .. boundaryIdx)` is still empty. Naming the boundary
+   * as "at or before the first human turn" was false on exactly that case,
+   * which is the clear majority of the firings this clause is emitted on: over
+   * 600 generated histories the human-bearing route fired 57 times, 46 of them
+   * at `boundary === firstHuman + 1`. The relation that holds on every firing
+   * is the one about what is left to compress, not about where the boundary
+   * sits relative to the turn.
+   */
+  nothingToCompress:
+    'no candidate boundary leaves anything between the first human turn and itself to compress',
+} as const;
+
+// ────────────────────────────────────────────────────────────────────────────
 // Middleware
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -595,62 +704,15 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
         const anchoredOnKeptFrame = frameAnchorApplies && !frameAnchorBelowGuard;
         const boundaryIdx = anchoredOnKeptFrame ? oldestKeptImageIdx : motionOrEndIdx;
         // Names which rule chose the boundary, and why each candidate that did
-        // not win dropped out. Pinned by test: the label is the only thing that
-        // says, from a log alone, which policy is in force on a live run — so
-        // every branch that can move the boundary has to be distinguishable
-        // here, including each way an anchor drops out.
-        //
-        // Every clause below is true on the branch that emits it, standing on
-        // its own, and that is the property this has to keep rather than a
-        // matter of wording. A clause APPENDED to a base chosen under the
-        // opposite assumption is what produced a single string asserting that
-        // no frame was worth holding back and then naming the kept frame that
-        // was — so the guard clause is selected here rather than suffixed.
-        let anchorLabel: string;
-        if (anchoredOnKeptFrame) {
-          // The frame won. Whether it precedes the last motion is decided by
-          // `motionTailFits`, NOT by `hasMotion`: once the motion anchor drops
-          // out, `motionOrEndIdx` is the end of the history, so
-          // `frameAnchorApplies` is satisfied by a frame ANYWHERE — including
-          // one far after the last motion, which is the shape a measured run
-          // hit at motion index 1 and frame index 65.
-          anchorLabel = motionTailFits
-            ? 'kept-frame-before-last-motion'
-            : hasMotion
-              ? 'oldest-kept-frame (last motion tail over threshold)'
-              : 'oldest-kept-frame';
-        } else if (motionTailFits) {
-          anchorLabel = frameAnchorBelowGuard
-            ? 'last-motion (kept frame below the summarize guard)'
-            : 'last-motion';
-        } else {
-          // Nothing was held back: the boundary is the end of the history.
-          // Name why each candidate dropped out, motion first.
-          //
-          // The frame arm is exhaustive by construction, so the parenthetical
-          // can never come out empty: `motionOrEndIdx` is `pruned.length`
-          // here, so `oldestKeptImageIdx < motionOrEndIdx` holds for every
-          // real index and `frameAnchorApplies` reduces to `keptFrameTailFits`
-          // — which is therefore false whenever the frame is not below the
-          // guard, i.e. whenever a frame exists its tail is the reason.
-          //
-          // The reasons are joined on a word, never on punctuation: the label
-          // is embedded in two lines that already use punctuation to delimit
-          // their own fields — a semicolon between fields on the summarize
-          // line, commas inside the warning's `(boundary=…, firstHuman=…,
-          // anchor=…)` — so either character inside the label truncates it for
-          // anything reading those fields.
-          const reasons: string[] = [];
-          if (hasMotion) reasons.push('last motion tail over threshold');
-          if (frameAnchorBelowGuard) {
-            reasons.push('kept frame below the summarize guard');
-          } else if (oldestKeptImageIdx >= 0) {
-            reasons.push('kept frame tail over threshold');
-          } else {
-            reasons.push('no frame worth holding back');
-          }
-          anchorLabel = `end-of-history (${reasons.join(' and ')})`;
-        }
+        // not win dropped out. Composed by `composeAnchorLabel` above, which
+        // holds the branches and the reasoning behind them.
+        const anchorLabel = composeAnchorLabel({
+          anchoredOnKeptFrame,
+          motionTailFits,
+          hasMotion,
+          frameAnchorBelowGuard,
+          hasKeptFrame: oldestKeptImageIdx >= 0,
+        });
 
         if (firstHumanIdx >= 0 && boundaryIdx > guardFloorIdx) {
           const headSlice = pruned.slice(firstHumanIdx + 1, boundaryIdx);
@@ -732,8 +794,18 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
           //
           //   - there is no human turn anywhere in the history, so there is no
           //     head to carve out and nothing to anchor it against; or
-          //   - every candidate boundary sits at or before the first human
-          //     turn, so the head is a single message or empty.
+          //   - no candidate boundary leaves anything between the first human
+          //     turn and itself to compress, so the head is a single message
+          //     or empty.
+          //
+          // Be exact about that second one, because "at or before the first
+          // human turn" is NOT what the failing predicate tests. It is
+          // `boundaryIdx <= guardFloorIdx` and `guardFloorIdx` is
+          // `firstHumanIdx + 1`, so a boundary one message AFTER the first
+          // human turn fails it too — with an empty head slice, which is what
+          // the clause has to name. That is the majority case rather than a
+          // corner: measured over 600 generated histories, 46 of the 57
+          // human-bearing firings sat at `boundary === firstHuman + 1`.
           //
           // Either way what is over the threshold is the preserved prefix plus
           // a tail that already fits, and neither is the summarizer's to
@@ -749,8 +821,8 @@ export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
           // summary actually lands.
           const cannotSummarizeCause =
             firstHumanIdx < 0
-              ? 'the history has no human turn to anchor a head against'
-              : 'every candidate boundary lands at or before the first human turn';
+              ? CANNOT_SUMMARIZE_CAUSES.noHumanTurn
+              : CANNOT_SUMMARIZE_CAUSES.nothingToCompress;
           unsummarizableThreads.add(threadId);
           console.warn(
             `[context-pruner] thread=${threadId} CANNOT SUMMARIZE: ` +

@@ -14,6 +14,8 @@ import { MemorySaver, messagesStateReducer } from '@langchain/langgraph'
 import {
   createContextPrunerMiddleware,
   estimateTokens,
+  composeAnchorLabel,
+  CANNOT_SUMMARIZE_CAUSES,
   __inflightSummariesForTest,
   __unsummarizableThreadsForTest,
 } from '../src/agent/contextPrunerMiddleware.js'
@@ -3370,6 +3372,23 @@ describe('contextPrunerMiddleware — RC-59 the anchor label names the cause tha
     expect(run.label).not.toContain('no frame worth holding back')
   })
 
+  // The cause clause sits between the warning's own delimiters — after
+  // `<threshold clause>) but ` and before ` (boundary=`. Reading it as a FIELD
+  // rather than as a substring is what makes the assertions below
+  // append-sensitive: `toContain` on the sentence passes just as happily when a
+  // clause has been added after it, which is how RC-59's cell survived
+  // append-mutations at 485/485 green while only a prefix mutation reddened it.
+  function warningCause(line: string): string {
+    return line.match(/\) but (.+?) \(boundary=/)?.[1] ?? `NO CAUSE FIELD IN: ${line}`
+  }
+
+  // The whole warning, shape-exact and anchored at both ends, so a clause
+  // appended anywhere in the line — not only inside the cause — reds. The
+  // varying parts are the token counts and the indices; everything else is
+  // asserted literally.
+  const WARNING_SHAPE =
+    /^\[context-pruner\] thread=test-thread CANNOT SUMMARIZE: threshold crossed \(pruned=\d+ ≥ \d+\) but .+ \(boundary=-?\d+, firstHuman=-?\d+, anchor=[^;]+\); nothing before it can be compressed, so this history will keep growing\. Reported once per thread\.$/
+
   it('INSTANCE 4: the CANNOT SUMMARIZE warning names the conjunct that actually failed', async () => {
     // The warning is the `else if` of `firstHumanIdx >= 0 && boundaryIdx >
     // guardFloorIdx`, so it fires when EITHER conjunct fails and its text named
@@ -3389,10 +3408,17 @@ describe('contextPrunerMiddleware — RC-59 the anchor label names the cause tha
     expect(missing.warned).toHaveLength(1)
     expect(missing.warned[0]).toContain('CANNOT SUMMARIZE')
     expect(missing.warned[0]).toContain('firstHuman=-1')
-    expect(missing.warned[0]).toContain('the history has no human turn to anchor a head against')
-    // The false sentence, named so it cannot come back.
+    // Field-exact, not `toContain`: this is the RC-59 route that was right and
+    // must stay exactly as it reads, and it now also reds on an appended clause.
+    expect(warningCause(missing.warned[0])).toBe(
+      'the history has no human turn to anchor a head against'
+    )
+    expect(missing.warned[0]).toMatch(WARNING_SHAPE)
+    // Cross-route contamination: the human-bearing cause must not appear here.
+    // Named as the CORRECTED sentence — RC-59 named the old wording, which this
+    // node deletes, so that assertion would from now on be one that cannot fail.
     expect(missing.warned[0]).not.toContain(
-      'every candidate boundary lands at or before the first human turn'
+      'no candidate boundary leaves anything between the first human turn and itself to compress'
     )
 
     // The pair. The warning is once per thread and the whole file shares one
@@ -3418,9 +3444,79 @@ describe('contextPrunerMiddleware — RC-59 the anchor label names the cause tha
     expect(clamped.llm.invoke).not.toHaveBeenCalled()
     expect(clamped.warned).toHaveLength(1)
     expect(clamped.warned[0]).toContain('firstHuman=0')
-    expect(clamped.warned[0]).toContain(
-      'every candidate boundary lands at or before the first human turn'
+    // RC-61: the sentence RC-59 shipped here — "every candidate boundary lands
+    // at or before the first human turn" — was false on this very fixture, which
+    // prints `boundary=1, firstHuman=0`. The failing predicate is
+    // `boundaryIdx <= firstHumanIdx + 1`, so the relation that actually holds is
+    // about what is left to compress. Asserted against the printed numbers, not
+    // taken on trust: the head slice this boundary would carve out is empty.
+    expect(clamped.warned[0]).toContain('boundary=1')
+    const boundary = Number(clamped.warned[0].match(/boundary=(-?\d+)/)?.[1])
+    const firstHuman = Number(clamped.warned[0].match(/firstHuman=(-?\d+)/)?.[1])
+    expect(boundary).toBeGreaterThan(firstHuman)
+    expect(Math.max(0, boundary - (firstHuman + 1))).toBe(0)
+    expect(warningCause(clamped.warned[0])).toBe(
+      'no candidate boundary leaves anything between the first human turn and itself to compress'
     )
+    expect(clamped.warned[0]).toMatch(WARNING_SHAPE)
     expect(clamped.warned[0]).not.toContain('no human turn to anchor a head against')
+  })
+
+  it('RC-61: no composed anchor label or cause clause carries the punctuation the log lines delimit on', () => {
+    // RC-59 established the constraint and wrote it into the code, but pinned it
+    // only by exact-string equality on whichever labels a fixture happened to
+    // reach — and the comma half by nothing at all. Here it is a PROPERTY over
+    // the whole set, so a label added later is covered the moment it exists.
+    //
+    // Why it matters: the label rides two lines that already use punctuation to
+    // delimit their own fields — `anchor=<label>;` on the summarize line, and
+    // `(boundary=…, firstHuman=…, anchor=<label>)` in the warning. A `;` or `,`
+    // inside the label truncates it for anything splitting on those, which is
+    // exactly what this file's own `anchor=([^;]*)` reader does.
+    const flags = [false, true]
+    const labels = new Set<string>()
+    for (const anchoredOnKeptFrame of flags)
+      for (const motionTailFits of flags)
+        for (const hasMotion of flags)
+          for (const frameAnchorBelowGuard of flags)
+            for (const hasKeptFrame of flags)
+              labels.add(
+                composeAnchorLabel({
+                  anchoredOnKeptFrame,
+                  motionTailFits,
+                  hasMotion,
+                  frameAnchorBelowGuard,
+                  hasKeptFrame,
+                })
+              )
+
+    // The set is enumerated exhaustively over the composer's inputs, so this
+    // count is the real denominator rather than a fixture's reach. If a branch
+    // is added, this number moves and the author has to look at it.
+    expect(labels.size).toBe(11)
+
+    const causes = Object.values(CANNOT_SUMMARIZE_CAUSES)
+    expect(causes).toHaveLength(2)
+
+    for (const s of [...labels, ...causes]) {
+      expect(s).not.toContain(';')
+      expect(s).not.toContain(',')
+      // Non-empty, so a label composed down to '' could not pass the two above
+      // vacuously.
+      expect(s.length).toBeGreaterThan(0)
+    }
+
+    // The property is only worth anything if the reader it protects really does
+    // truncate. Drive each label through the exact field-splitting the log lines
+    // use and require it back whole.
+    for (const label of labels) {
+      const summarizeLine = `[context-pruner] thread=t threshold crossed (pruned=1 ≥ 1); anchor=${label}; summarizing head of 2 messages…`
+      expect(summarizeLine.match(/anchor=([^;]*)/)?.[1]).toBe(label)
+      const warningLine = `[context-pruner] thread=t CANNOT SUMMARIZE: threshold crossed (pruned=1 ≥ 1) but ${CANNOT_SUMMARIZE_CAUSES.nothingToCompress} (boundary=1, firstHuman=0, anchor=${label}); nothing before it can be compressed, so this history will keep growing. Reported once per thread.`
+      expect(warningLine.match(/\(boundary=[^)]*, firstHuman=[^)]*, anchor=([^;]*)\);/)?.[1]).toBe(
+        label
+      )
+      expect(warningCause(warningLine)).toBe(CANNOT_SUMMARIZE_CAUSES.nothingToCompress)
+    }
   })
 })
