@@ -8,6 +8,7 @@ import {
   RemoveMessage,
   isHumanMessage,
   isSystemMessage,
+  isToolMessage,
   type BaseMessage,
 } from '@langchain/core/messages'
 import { MemorySaver, messagesStateReducer } from '@langchain/langgraph'
@@ -20,6 +21,11 @@ import {
   __unsummarizableThreadsForTest,
 } from '../src/agent/contextPrunerMiddleware.js'
 import { __resetMotionLogForTest, isMotionToolCall } from '../src/agent/motionLog.js'
+import {
+  foreignHumanMessage,
+  foreignToolMessage,
+  isForeignToThisCore,
+} from './helpers/foreignCoreMessage.js'
 
 interface HookContainer {
   beforeModel?: unknown
@@ -96,9 +102,9 @@ describe('contextPrunerMiddleware — mechanical prune', () => {
     expect(result).toBeTruthy()
     const updated = (result as { messages: BaseMessage[] }).messages
     // [RemoveMessage, userMsg, motionAi, prunedToolMessage, injected]
-    expect(updated[0]).toBeInstanceOf(RemoveMessage)
+    expect(updated[0].getType()).toBe('remove')
     const toolOut = updated[3] as ToolMessage
-    expect(toolOut).toBeInstanceOf(ToolMessage)
+    expect(isToolMessage(toolOut)).toBe(true)
     const parsed = JSON.parse(toolOut.content as string)
     expect(parsed.data).toBeUndefined()
     expect(parsed.motion).toBe('turn_right (steps=1)')
@@ -247,7 +253,7 @@ describe('contextPrunerMiddleware — mechanical prune', () => {
       runtime
     )
     const updated = (result as { messages: BaseMessage[] }).messages
-    const ids = updated.filter((m) => !(m instanceof RemoveMessage)).map((m) => m.id)
+    const ids = updated.filter((m) => m.getType() !== 'remove').map((m) => m.id)
     // Every rewritten message retains its original id; none are undefined.
     expect(ids).toEqual(['h-user', 'ai-motion', 'tool-motion', 'h-img-old', 'ai-last'])
   })
@@ -328,19 +334,19 @@ describe('contextPrunerMiddleware — threshold summarization', () => {
 
     expect(llm.invoke).toHaveBeenCalledTimes(1)
     const updated = (result as { messages: BaseMessage[] }).messages
-    expect(updated[0]).toBeInstanceOf(RemoveMessage)
+    expect(updated[0].getType()).toBe('remove')
     // First non-Remove entry is the original user message verbatim.
-    expect(updated[1]).toBeInstanceOf(HumanMessage)
+    expect(isHumanMessage(updated[1])).toBe(true)
     expect((updated[1] as HumanMessage).content).toBe('Get the robot to the cone.')
     // Then the summary as a clearly-marked HumanMessage (RC-17: a SystemMessage
     // here sits at index ≥ 1, which @langchain/anthropic rejects outright).
-    expect(updated[2]).toBeInstanceOf(HumanMessage)
-    expect(updated[2]).not.toBeInstanceOf(SystemMessage)
+    expect(isHumanMessage(updated[2])).toBe(true)
+    expect(isSystemMessage(updated[2])).toBe(false)
     expect((updated[2] as HumanMessage).content).toContain('[Context summary]')
     expect((updated[2] as HumanMessage).content).toContain(SUMMARY_TEXT)
     // Tail is the motion turn (AIMessage + ToolMessage + injected composite).
     expect(updated[3]).toBe(motionAi)
-    expect(updated[4]).toBeInstanceOf(ToolMessage)
+    expect(isToolMessage(updated[4])).toBe(true)
     expect(updated[5]).toBe(injected)
   })
 
@@ -414,7 +420,7 @@ describe('contextPrunerMiddleware — threshold summarization', () => {
     )
     expect(llm.invoke).toHaveBeenCalledTimes(1)
     const sanitizedInput = llm.invoke.mock.calls[0][0] as BaseMessage[]
-    expect(sanitizedInput[0]).toBeInstanceOf(SystemMessage)
+    expect(isSystemMessage(sanitizedInput[0])).toBe(true)
     expect((sanitizedInput[0] as SystemMessage).content).toBe('CUSTOM PRUNER PROMPT')
   })
 })
@@ -457,14 +463,14 @@ describe('contextPrunerMiddleware — estimateTokens', () => {
 describe('contextPrunerMiddleware — RC-17 mid-history SystemMessage fix', () => {
   function systemIndices(messages: BaseMessage[]): number[] {
     return messages
-      .map((m, i) => (m instanceof SystemMessage ? i : -1))
+      .map((m, i) => (isSystemMessage(m) ? i : -1))
       .filter((i) => i >= 0)
   }
 
   function summaryMessages(messages: BaseMessage[]): HumanMessage[] {
     return messages.filter(
       (m): m is HumanMessage =>
-        m instanceof HumanMessage && String(m.content).startsWith('[Context summary]')
+        isHumanMessage(m) && String(m.content).startsWith('[Context summary]')
     )
   }
 
@@ -515,7 +521,7 @@ describe('contextPrunerMiddleware — RC-17 mid-history SystemMessage fix', () =
 
     expect(result).toBeTruthy()
     const updated = (result as { messages: BaseMessage[] }).messages
-    expect(updated[0]).toBeInstanceOf(RemoveMessage)
+    expect(updated[0].getType()).toBe('remove')
     const rebuilt = updated.slice(1)
     // The invariant Anthropic enforces.
     expect(systemIndices(rebuilt)).toEqual([])
@@ -579,7 +585,7 @@ describe('contextPrunerMiddleware — RC-17 mid-history SystemMessage fix', () =
     const { nextTurn } = crashShapedHistory()
     const r1 = await before({ messages: nextTurn }, runtime)
     const rebuilt1 = (r1 as { messages: BaseMessage[] }).messages.filter(
-      (m) => !(m instanceof RemoveMessage)
+      (m) => m.getType() !== 'remove'
     )
     const c1 = summaryMessages(rebuilt1)
     expect(c1).toHaveLength(1)
@@ -602,7 +608,7 @@ describe('contextPrunerMiddleware — RC-17 mid-history SystemMessage fix', () =
     const cycle2Input = [...rebuilt1, motionAi2, motionTool2, composite2]
     const r2 = await before({ messages: cycle2Input }, runtime)
     const rebuilt2 = (r2 as { messages: BaseMessage[] }).messages.filter(
-      (m) => !(m instanceof RemoveMessage)
+      (m) => m.getType() !== 'remove'
     )
 
     // No accumulation: exactly ONE summary, carrying cycle-2's text and NOT
@@ -671,7 +677,7 @@ describe('contextPrunerMiddleware — RC-17 mid-history SystemMessage fix', () =
       result === undefined
         ? []
         : (result as { messages: BaseMessage[] }).messages.filter(
-            (m) => !(m instanceof RemoveMessage)
+            (m) => m.getType() !== 'remove'
           )
     expect(systemIndices(rebuilt)).toEqual([])
     expect(summaryMessages(rebuilt)).toHaveLength(0)
@@ -3518,5 +3524,116 @@ describe('contextPrunerMiddleware — RC-59 the anchor label names the cause tha
       )
       expect(warningCause(warningLine)).toBe(CANNOT_SUMMARIZE_CAUSES.nothingToCompress)
     }
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────────────
+// RC-58 — the pruner's work must land on messages from a FOREIGN
+// @langchain/core copy, not only on the ones this file builds
+//
+// Every other fixture above is constructed with `new ToolMessage(...)` from the
+// copy this file imports, so `instanceof` and `getType()` agree on all of them
+// and the two spellings are indistinguishable. That is not the history the
+// pruner meets on the server: it arrives through gaunt-sloth's AG-UI pipeline,
+// and RC-21 is where a message from that side failed `instanceof ToolMessage`,
+// silently skipped the guard meant to see it, and cost a real bug that the whole
+// suite was structurally unable to catch.
+//
+// These cases feed the pruner exactly that shape. They are what makes the
+// duck-typed checks in `mechanicalPrune` load-bearing here: revert
+// `isToolMessage` or `isHumanMessage` in `src/agent/contextPrunerMiddleware.ts`
+// to `instanceof` and they go red, while every native-fixture case above stays
+// green.
+// ───────────────────────────────────────────────────────────────────────────
+describe('contextPrunerMiddleware — RC-58 foreign-copy messages are pruned too', () => {
+  it('the fixtures really are foreign to the copy this file imports', () => {
+    expect(isForeignToThisCore(foreignToolMessage({ content: '{}' }))).toBe(true)
+    expect(isForeignToThisCore(foreignHumanMessage({ content: 'hi' }))).toBe(true)
+    // ...and the control: a message from THIS copy is not foreign, so the check
+    // above cannot be passing for everything.
+    expect(isForeignToThisCore(new HumanMessage('hi'))).toBe(false)
+  })
+
+  it('strips the image payload out of a foreign-copy ToolMessage', async () => {
+    const mw = createContextPrunerMiddleware({ llm: makeStubLlm() }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const foreignTool = foreignToolMessage({
+      id: 'tool-foreign',
+      content: motionResultJson('turn_right (steps=1)'),
+      tool_call_id: 'tc-foreign',
+      name: 'turn_right',
+    })
+    const result = await before(
+      {
+        messages: [
+          new HumanMessage({ id: 'h-user', content: 'go' }),
+          new AIMessage({
+            id: 'ai-motion',
+            content: '',
+            tool_calls: [{ name: 'turn_right', args: { steps: 1 }, id: 'tc-foreign' }],
+          }),
+          foreignTool,
+          new HumanMessage({
+            id: 'h-img',
+            content: [{ type: 'text', text: 'Before/After frames.' }, imageBlock()],
+          }),
+        ],
+      },
+      runtime
+    )
+
+    expect(result).toBeTruthy()
+    const out = (result as { messages: BaseMessage[] }).messages.filter(
+      (m) => m.getType() !== 'remove'
+    )
+    const toolOut = out.find((m) => m.id === 'tool-foreign')
+    expect(toolOut).toBeDefined()
+    const parsed = JSON.parse((toolOut as BaseMessage).content as string)
+    // The base64 frame is what makes a history unaffordable; it must be gone,
+    // and the message must say so rather than silently losing the field.
+    expect(parsed.data).toBeUndefined()
+    expect(parsed.dataDropped).toBe(true)
+    // The rest of the payload survives the strip.
+    expect(parsed.motion).toBe('turn_right (steps=1)')
+    expect(parsed.mimeType).toBe('image/jpeg')
+  })
+
+  it('prunes image blocks out of an aged-out foreign-copy HumanMessage', async () => {
+    const mw = createContextPrunerMiddleware({
+      llm: makeStubLlm(),
+      keepLatestImages: 1,
+    }) as HookContainer
+    const before = getHook(mw.beforeModel)
+
+    const older = foreignHumanMessage({
+      id: 'h-old-foreign',
+      content: [{ type: 'text', text: 'Old frame' }, imageBlock()],
+    })
+    const newer = new HumanMessage({
+      id: 'h-new',
+      content: [{ type: 'text', text: 'New frame' }, imageBlock()],
+    })
+    const result = await before(
+      { messages: [new HumanMessage({ id: 'h-user', content: 'go' }), older, newer] },
+      runtime
+    )
+
+    expect(result).toBeTruthy()
+    const out = (result as { messages: BaseMessage[] }).messages.filter(
+      (m) => m.getType() !== 'remove'
+    )
+    const agedOut = out.find((m) => m.id === 'h-old-foreign')
+    expect(agedOut).toBeDefined()
+    const blocks = (agedOut as BaseMessage).content as Array<{ type?: string }>
+    expect(blocks.some((b) => b.type === 'image_url' || b.type === 'image')).toBe(false)
+    // The caption survives — the turn keeps its slot in the transcript.
+    expect(blocks.some((b) => b.type === 'text')).toBe(true)
+
+    // The newest frame is the one kept, so this is a real split and not
+    // "everything was stripped".
+    const kept = out.find((m) => m.id === 'h-new')
+    const keptBlocks = (kept as BaseMessage).content as Array<{ type?: string }>
+    expect(keptBlocks.some((b) => b.type === 'image_url')).toBe(true)
   })
 })

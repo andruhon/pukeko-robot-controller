@@ -4,7 +4,6 @@ import {
   HumanMessage,
   SystemMessage,
   ToolMessage,
-  RemoveMessage,
   type BaseMessage,
 } from '@langchain/core/messages'
 import {
@@ -15,7 +14,13 @@ import {
   __motionLogForTest,
 } from '../src/agent/motionSummarizationMiddleware.js'
 
-import { isAIMessage, isToolMessage } from '@langchain/core/messages'
+import {
+  isAIMessage,
+  isHumanMessage,
+  isSystemMessage,
+  isToolMessage,
+} from '@langchain/core/messages'
+import { foreignHumanMessage, isForeignToThisCore } from './helpers/foreignCoreMessage.js'
 
 // Collect every tool_use id an AIMessage carries, from BOTH representations:
 // the generic `.tool_calls` array AND Anthropic-native `tool_use` content
@@ -156,14 +161,14 @@ describe('motionSummarizationMiddleware', () => {
     expect(result).toBeTruthy()
     const updated = (result as { messages: BaseMessage[] }).messages
     // First entry is the REMOVE_ALL_MESSAGES marker.
-    expect(updated[0]).toBeInstanceOf(RemoveMessage)
+    expect(updated[0].getType()).toBe('remove')
     // Next entry is the original user message verbatim.
-    expect(updated[1]).toBeInstanceOf(HumanMessage)
+    expect(isHumanMessage(updated[1])).toBe(true)
     expect((updated[1] as HumanMessage).content).toBe('Get the robot to the red cone.')
     // Then the summary as a clearly-marked HumanMessage (RC-16: a SystemMessage
     // here sits at index ≥ 1, which @langchain/anthropic rejects outright).
-    expect(updated[2]).toBeInstanceOf(HumanMessage)
-    expect(updated[2]).not.toBeInstanceOf(SystemMessage)
+    expect(isHumanMessage(updated[2])).toBe(true)
+    expect(isSystemMessage(updated[2])).toBe(false)
     expect((updated[2] as HumanMessage).content).toContain('[Motion summary]')
     expect((updated[2] as HumanMessage).content).toContain(SUMMARY_TEXT)
     // Then the most recent motion turn (AIMessage with motion tool call, ToolMessage, composite HumanMessage).
@@ -197,7 +202,7 @@ describe('motionSummarizationMiddleware', () => {
     const sanitizedInput = llm.invoke.mock.calls[0][0] as BaseMessage[]
     // First entry is our summarization system prompt; the user prompt should be intact among the rest.
     const userInSanitized = sanitizedInput.find(
-      (m) => m instanceof HumanMessage && m.content === 'Find the red cone.'
+      (m) => isHumanMessage(m) && m.content === 'Find the red cone.'
     )
     expect(userInSanitized).toBeDefined()
     // No image blocks remain in any sanitized message.
@@ -229,7 +234,7 @@ describe('motionSummarizationMiddleware', () => {
 
     expect(llm.invoke).toHaveBeenCalledTimes(1)
     const sanitizedInput = llm.invoke.mock.calls[0][0] as BaseMessage[]
-    expect(sanitizedInput[0]).toBeInstanceOf(SystemMessage)
+    expect(isSystemMessage(sanitizedInput[0])).toBe(true)
     expect((sanitizedInput[0] as SystemMessage).content).toBe('CUSTOM SUMMARY PROMPT')
   })
 
@@ -279,7 +284,7 @@ describe('motionSummarizationMiddleware', () => {
 
     const updated = (result as { messages: BaseMessage[] }).messages
     const summaryMsg = updated[2] as HumanMessage
-    expect(summaryMsg).toBeInstanceOf(HumanMessage)
+    expect(isHumanMessage(summaryMsg)).toBe(true)
     expect(summaryMsg.content).toContain('Recent motions (newest last):')
     expect(summaryMsg.content).toContain('turn_right (steps=3) (pending')
   })
@@ -439,9 +444,9 @@ describe('motionSummarizationMiddleware', () => {
         new AIMessage({ content: '', tool_calls: [{ name: 'turn_right', args: { steps: 3 }, id: 'tc-motion' }] }),
       ]
       const built = buildSummarizationMessages(history, 'PROMPT')
-      expect(built[0]).toBeInstanceOf(SystemMessage)
+      expect(isSystemMessage(built[0])).toBe(true)
       expect((built[0] as SystemMessage).content).toBe('PROMPT')
-      expect(built[built.length - 1]).toBeInstanceOf(HumanMessage)
+      expect(isHumanMessage(built[built.length - 1])).toBe(true)
       expect((built[built.length - 1] as HumanMessage).content).toBe('Write the summary now.')
       // The unpaired motion call between the wrappers has been stripped.
       assertNoUnpairedToolUse(built)
@@ -460,7 +465,7 @@ describe('motionSummarizationMiddleware', () => {
   describe('RC-16 mid-history SystemMessage fix', () => {
     function systemIndices(messages: BaseMessage[]): number[] {
       return messages
-        .map((m, i) => (m instanceof SystemMessage ? i : -1))
+        .map((m, i) => (isSystemMessage(m) ? i : -1))
         .filter((i) => i >= 0)
     }
 
@@ -506,14 +511,14 @@ describe('motionSummarizationMiddleware', () => {
 
       expect(result).toBeTruthy()
       const updated = (result as { messages: BaseMessage[] }).messages
-      expect(updated[0]).toBeInstanceOf(RemoveMessage)
+      expect(updated[0].getType()).toBe('remove')
       const rebuilt = updated.slice(1)
       // The invariant Anthropic enforces.
       expect(systemIndices(rebuilt)).toEqual([])
       // The summary content still lands, as a marked HumanMessage, with the
       // pinned state (afterModel logged the motion, so it is present here).
       const summaryMsg = rebuilt.find(
-        (m) => m instanceof HumanMessage && String(m.content).startsWith('[Motion summary]')
+        (m) => isHumanMessage(m) && String(m.content).startsWith('[Motion summary]')
       )
       expect(summaryMsg).toBeDefined()
       expect((summaryMsg as HumanMessage).content).toContain(SUMMARY_TEXT)
@@ -535,7 +540,7 @@ describe('motionSummarizationMiddleware', () => {
       const rebuilt = (result as { messages: BaseMessage[] }).messages.slice(1)
       expect(systemIndices(rebuilt)).toEqual([])
       const summaryMsg = rebuilt.find(
-        (m) => m instanceof HumanMessage && String(m.content).startsWith('[Motion summary]')
+        (m) => isHumanMessage(m) && String(m.content).startsWith('[Motion summary]')
       )
       expect(summaryMsg).toBeDefined()
       expect((summaryMsg as HumanMessage).content).toContain(SUMMARY_TEXT)
@@ -585,5 +590,88 @@ describe('motionSummarizationMiddleware', () => {
       const result = await before({ messages: nextTurn }, runtime)
       expect(result).toBeUndefined()
     })
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────────────
+// RC-58 — the summarizer must recognise a FOREIGN-copy HumanMessage
+//
+// Every fixture above is built with `new HumanMessage(...)` from the copy this
+// file imports, so `instanceof` and `getType()` agree on all of them. The real
+// history does not come from here — it arrives through gaunt-sloth's AG-UI
+// pipeline, and RC-21 is where a message from that side failed `instanceof` and
+// was silently invisible to the guard meant to see it.
+//
+// `firstHumanIdx` is where that would bite here. It is the anchor for the whole
+// rewrite: if the user's opening turn is not recognised as a HumanMessage the
+// index is -1, beforeModel bails, and the summary is never applied — no crash,
+// no warning, just a history that grows forever. Reverting `isHumanMessage` in
+// `src/agent/motionSummarizationMiddleware.ts` to `instanceof` turns this red
+// while every native-fixture case above stays green.
+// ───────────────────────────────────────────────────────────────────────────
+describe('motionSummarizationMiddleware — RC-58 a foreign-copy first HumanMessage still anchors the rewrite', () => {
+  // The PLAT-13 crash shape again, but with the opening user turn arriving from
+  // the other core copy — the one thing that differs from the cases above.
+  function foreignAnchoredHistory() {
+    const user = foreignHumanMessage({ id: 'u-foreign', content: 'Drive the robot to the cone.' })
+    const statusAi = new AIMessage({
+      content: '',
+      tool_calls: [{ name: 'read_status', args: {}, id: 'tc-status' }],
+    })
+    const statusTool = new ToolMessage({
+      content: JSON.stringify({ battery: '7.4V', ok: true }),
+      tool_call_id: 'tc-status',
+      name: 'read_status',
+    })
+    const motionAi = new AIMessage({
+      content: '',
+      tool_calls: [{ name: 'turn_right', args: { steps: 3 }, id: 'tc-motion' }],
+    })
+    const motionTool = new ToolMessage({
+      content: JSON.stringify({ motion: 'turn_right (steps=3)' }),
+      tool_call_id: 'tc-motion',
+      name: 'turn_right',
+    })
+    return {
+      atMotion: [user, statusAi, statusTool, motionAi],
+      nextTurn: [user, statusAi, statusTool, motionAi, motionTool],
+      user,
+    }
+  }
+
+  it('the fixture really is foreign to the copy this file imports', () => {
+    expect(isForeignToThisCore(foreignHumanMessage({ content: 'hi' }))).toBe(true)
+    // The control: a message from THIS copy is not foreign, so the check above
+    // cannot be passing for everything.
+    expect(isForeignToThisCore(new HumanMessage('hi'))).toBe(false)
+  })
+
+  it('applies the summary when the opening user turn came from the other copy', async () => {
+    const llm = makeStubLlm()
+    const mw = createMotionSummarizationMiddleware({ llm }) as HookContainer
+    const after = getHook(mw.afterModel)
+    const before = getHook(mw.beforeModel)
+
+    const { atMotion, nextTurn } = foreignAnchoredHistory()
+    await after({ messages: atMotion }, runtime)
+    const result = await before({ messages: nextTurn }, runtime)
+
+    // The rewrite happened at all — this is the assertion that goes to
+    // `undefined` the moment `firstHumanIdx` stops finding the foreign turn.
+    expect(result).toBeTruthy()
+    const updated = (result as { messages: BaseMessage[] }).messages
+    expect(updated[0].getType()).toBe('remove')
+    const rebuilt = updated.slice(1)
+
+    // The foreign opening turn is kept verbatim as the head of the rebuild.
+    expect(rebuilt[0].content).toBe('Drive the robot to the cone.')
+
+    // ...and the summary rides as a marked HumanMessage, never a SystemMessage.
+    const summaryMsg = rebuilt.find(
+      (m) => isHumanMessage(m) && String(m.content).startsWith('[Motion summary]')
+    )
+    expect(summaryMsg).toBeDefined()
+    expect(String((summaryMsg as BaseMessage).content)).toContain(SUMMARY_TEXT)
+    expect(rebuilt.filter((m) => isSystemMessage(m))).toEqual([])
   })
 })

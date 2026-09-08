@@ -19,6 +19,8 @@ import {
   AIMessage,
   HumanMessage,
   ToolMessage,
+  isHumanMessage,
+  isToolMessage,
   type BaseMessage,
 } from '@langchain/core/messages'
 import {
@@ -32,6 +34,11 @@ import { z } from 'zod'
 import { createFrontendImageInjectionMiddleware } from '../src/agent/frontendImageInjectionMiddleware.js'
 import { createContextPrunerMiddleware } from '../src/agent/contextPrunerMiddleware.js'
 import type { LlmProvider } from '../src/lib/config.js'
+import {
+  foreignHumanMessage,
+  foreignToolMessage,
+  isForeignToThisCore,
+} from './helpers/foreignCoreMessage.js'
 
 const B64 = 'BASE64IMAGEDATA_deadbeef'
 
@@ -58,7 +65,7 @@ function summarize(messages: BaseMessage[]): MsgSummary[] {
     const s: MsgSummary = { type: m.getType(), hasImageBlock: hasImageBlock(m.content) }
     const name = (m as unknown as { name?: string }).name
     if (name) s.name = name
-    if (m instanceof ToolMessage && typeof m.content === 'string') {
+    if (isToolMessage(m) && typeof m.content === 'string') {
       try {
         const parsed = JSON.parse(m.content) as Record<string, unknown>
         s.dataPresent = typeof parsed.data === 'string' && parsed.data.length > 0
@@ -72,7 +79,7 @@ function summarize(messages: BaseMessage[]): MsgSummary[] {
 }
 
 function countVision(messages: BaseMessage[]): number {
-  return messages.filter((m) => m instanceof HumanMessage && hasImageBlock(m.content)).length
+  return messages.filter((m) => isHumanMessage(m) && hasImageBlock(m.content)).length
 }
 
 // ── Recording, scripted, tool-calling fake model ──
@@ -494,5 +501,126 @@ describe('RC-21 defect (1) — two-capture multi-turn (guard + REMOVE_ALL persis
     // (keepLatestImages=1 keeps the newest; older ones become text-only).
     expect(captureCalls.length).toBeGreaterThanOrEqual(2)
     for (const v of visionCounts) expect(v).toBeGreaterThanOrEqual(1)
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────────────
+// RC-58 — the same presence question, for a history from a FOREIGN
+// @langchain/core copy
+//
+// Everything above builds its history through this repo's own `createAgent`,
+// and that is a narrower world than the server's: LangGraph's ToolNode re-mints
+// every tool result into the `ToolMessage` class THIS copy exports, so no
+// fixture above can be anything but native — measured, not assumed, while
+// writing this. The cross-copy history does not come from ToolNode; it arrives
+// already assembled from gaunt-sloth's AG-UI pipeline, and the middlewares meet
+// it as a plain inbound message list. That is the world RC-21's bug lived in
+// (tool-data:1 / human-images:0 / imageCount:0), and it is what these cases
+// reconstruct: the real FI→CP chain, in the profile's order, over a history
+// whose capture result and whose earlier frame both come from the other copy.
+//
+// The measuring instruments are this file's own `summarize()` and
+// `countVision()`, so these cases also exercise the duck-typed forms those two
+// helpers were converted to.
+// ───────────────────────────────────────────────────────────────────────────
+describe('RC-21/RC-58 — vision presence for a foreign-copy inbound history', () => {
+  function beforeModelOf(mw: unknown): (s: unknown, r: unknown) => Promise<unknown> {
+    const hook = (mw as { beforeModel?: unknown }).beforeModel
+    if (typeof hook === 'function') return hook as (s: unknown, r: unknown) => Promise<unknown>
+    if (hook && typeof hook === 'object' && 'hook' in hook) {
+      return (hook as { hook: (s: unknown, r: unknown) => Promise<unknown> }).hook
+    }
+    throw new Error('no beforeModel hook')
+  }
+
+  /** Run the profile's real chain — frontend-images, then context-pruner — the
+   *  way the agent drives it, over an inbound history. */
+  async function runChain(messages: BaseMessage[], threadId: string): Promise<BaseMessage[]> {
+    const runtime = { configurable: { thread_id: threadId } }
+    const fi = createFrontendImageInjectionMiddleware({ provider: 'openai' })
+    const cp = createContextPrunerMiddleware({ llm: stubSummarizerLlm() })
+
+    const afterFi = (await beforeModelOf(fi)({ messages }, runtime)) as
+      | { messages: BaseMessage[] }
+      | undefined
+    const merged = afterFi?.messages ?? messages
+
+    const afterCp = (await beforeModelOf(cp)({ messages: merged }, runtime)) as
+      | { messages: BaseMessage[] }
+      | undefined
+    if (!afterCp) return merged
+    return afterCp.messages.filter((m) => m.getType() !== 'remove')
+  }
+
+  function foreignCaptureHistory(uid: string): BaseMessage[] {
+    return [
+      new HumanMessage('take a picture, what do you see?'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ name: 'capture_image', args: {}, id: `tc-${uid}` }],
+      }),
+      foreignToolMessage({
+        id: `tool-${uid}`,
+        content: JSON.stringify({ mimeType: 'image/jpeg', data: B64 }),
+        tool_call_id: `tc-${uid}`,
+        name: 'capture_image',
+      }),
+    ]
+  }
+
+  it('the fixtures really are foreign to the copy this file imports', () => {
+    expect(isForeignToThisCore(foreignCaptureHistory('probe')[2])).toBe(true)
+    // The control: the native entries in the same history are not foreign, so
+    // the check above cannot be passing for everything.
+    expect(isForeignToThisCore(foreignCaptureHistory('probe')[0])).toBe(false)
+  })
+
+  it('a foreign-copy capture result still reaches the model as a vision block', async () => {
+    const uid = `fc-${Date.now()}`
+    const out = await runChain(foreignCaptureHistory(uid), uid)
+
+    // The golden failure was human-images:0. This is the number that goes back
+    // to 0 the moment FI's guard stops recognising a foreign capture result.
+    expect(countVision(out)).toBe(1)
+
+    // And the trace agrees about WHY: the tool result was seen as a tool
+    // message carrying image data, and the pruner then dropped that data
+    // (tool-data is not what the model reads — the injected frame is).
+    const summarized = summarize(out)
+    const toolEntry = summarized.find((s) => s.type === 'tool')
+    expect(toolEntry).toBeDefined()
+    expect(toolEntry?.name).toBe('capture_image')
+    expect(toolEntry?.dataDropped).toBe(true)
+    expect(toolEntry?.dataPresent).toBe(false)
+  })
+
+  it('counts and ages out a foreign-copy vision HumanMessage already in the history', async () => {
+    const uid = `fh-${Date.now()}`
+    // An earlier turn's injected frame, as it comes back in from the other copy,
+    // ahead of a fresh native capture turn.
+    const olderForeignFrame = foreignHumanMessage({
+      id: `h-old-${uid}`,
+      content: [
+        { type: 'text', text: 'Before/After frames for turn_right (steps=1).' },
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${B64}` } },
+      ],
+    })
+    const history = [
+      new HumanMessage('keep going'),
+      olderForeignFrame,
+      ...foreignCaptureHistory(uid).slice(1),
+    ]
+
+    // countVision sees the foreign frame before the chain runs at all: with
+    // `instanceof` it would have counted 0 here.
+    expect(countVision(history)).toBe(1)
+
+    const out = await runChain(history, uid)
+    // keepLatestImages defaults to 1, so the newly injected frame is kept and
+    // the older foreign one is aged out — exactly as for a native frame.
+    expect(countVision(out)).toBe(1)
+    const aged = out.find((m) => m.id === `h-old-${uid}`)
+    expect(aged).toBeDefined()
+    expect(hasImageBlock((aged as BaseMessage).content)).toBe(false)
   })
 })

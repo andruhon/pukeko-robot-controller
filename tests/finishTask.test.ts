@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { ToolMessage } from '@langchain/core/messages'
+import { isToolMessage } from '@langchain/core/messages'
 import type { StructuredToolInterface } from '@langchain/core/tools'
 import { createRobotTools } from '../src/agent/robotTools.js'
 
@@ -40,7 +40,7 @@ describe('finish_task tool', () => {
   it('returns a named FINISH ToolMessage (router matches on the name → END)', async () => {
     const tool = getFinishTool()
     const result = await invokeFinish(tool, 'success', 'reached the cone')
-    expect(result).toBeInstanceOf(ToolMessage)
+    expect(isToolMessage(result)).toBe(true)
     expect(result.name).toBe('finish_task')
     expect(result.content).toBe('FINISH[success]: reached the cone')
   })

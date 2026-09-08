@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest'
-import { AIMessage, HumanMessage, type BaseMessage } from '@langchain/core/messages'
+import {
+  AIMessage,
+  HumanMessage,
+  isHumanMessage,
+  type BaseMessage,
+} from '@langchain/core/messages'
 import { createLazyToolRecoveryMiddleware } from '../src/agent/lazyToolRecoveryMiddleware.js'
 
 interface HookContainer {
@@ -72,7 +77,7 @@ describe('lazyToolRecoveryMiddleware', () => {
     // The recovery handler call received the lazy reply + a nudge appended.
     const secondCallReq = handler.mock.calls[1][0] as { messages: BaseMessage[] }
     const appended = secondCallReq.messages
-    expect(appended.at(-1)).toBeInstanceOf(HumanMessage)
+    expect(isHumanMessage(appended.at(-1) as BaseMessage)).toBe(true)
     expect((appended.at(-1) as HumanMessage).content).toContain('did not actually call the tool')
   })
 
@@ -180,7 +185,7 @@ describe('lazyToolRecoveryMiddleware', () => {
       expect((out as AIMessage).tool_calls?.[0].name).toBe('read_distance')
 
       const nudge = (handler.mock.calls[1][0] as { messages: BaseMessage[] }).messages.at(-1)
-      expect(nudge).toBeInstanceOf(HumanMessage)
+      expect(isHumanMessage(nudge as BaseMessage)).toBe(true)
       expect((nudge as HumanMessage).content).toContain('finish_task')
     })
 
