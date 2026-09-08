@@ -338,6 +338,21 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
    * a new outcome to handle. It is checked AFTER `attempt`, which preserves the
    * try-at-least-once property above: a status that cannot improve still gets
    * its one shot, so this can only ever remove waiting, never a capture.
+   *
+   * THAT ORDERING IS DELIBERATE BUT NOT TEST-ENFORCEABLE, and the next reader
+   * should know it is unenforceable rather than merely unenforced. Moving the
+   * abort above `attempt` is observable only in a state where `attempt` would
+   * have succeeded WHILE the status cannot improve — i.e. a decodable frame from
+   * a camera reporting `denied`/`no-device`/`busy`. `PkWebcamPanel` never
+   * produces it: `isActive` is set true only on the success path, immediately
+   * after the status is set to `live`, and every terminal status is assigned in
+   * the same catch block that sets `isActive` false. A frame requires
+   * `isActive`, so a frame implies `live`. The two conditions are therefore
+   * mutually exclusive at the source, and a spec pinning the order could only do
+   * it by fabricating a panel state the real component cannot reach.
+   *
+   * Keep the order anyway: it costs nothing, and it is the correct order if a
+   * future capture surface ever decouples "has frames" from "reports live".
    */
   async function pollUntil<T>(
     deadline: number,

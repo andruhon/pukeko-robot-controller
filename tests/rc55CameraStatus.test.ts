@@ -29,6 +29,19 @@ import { z } from 'zod'
 // advanced, and the specs in "what still waits" hold the other side: they fail
 // if the deadline is skipped for a camera that deserved it.
 //
+// A NOTE ON PROVING THAT NO OTHER SPEC REPORTS A CAMERA STATUS.
+//
+// The RC-55 wiring is keyed on a status no pre-existing fake supplies, and the
+// obvious way to establish that is to grep `tests/` for `cameraStatus`. That
+// grep is BLIND to one spec: worlds.test.ts mounts a real <PkWebcamPanel> and
+// reads its exposed surface, so it carries a status without ever naming the
+// token. It happens to be harmless — under jsdom the panel's getUserMedia
+// rejects and it reports `error`, which maps to the frozen message — but that is
+// luck, not the grep's doing: a panel reporting `no-device` would have reached
+// the fail-fast path with the grep just as silent. If you need that absence
+// proof again, enumerate the specs that construct a PANEL, not the ones that
+// mention the member.
+//
 // Every expected string is written out BY HAND rather than read back off
 // `captureFailureMessage`. That is the point: reading the expected value off the
 // module under test lets an implementation that stops consulting vue-ui satisfy
@@ -55,7 +68,6 @@ const NOT_INITIALIZED = 'Webcam not initialized'
 
 // 'HI' as bytes; base64 'SEk=' computed independently of the encoder under test.
 const FRAME_BYTES = Uint8Array.from([0x48, 0x49])
-const SNAPSHOT_DATA_URL = 'data:image/jpeg;base64,SEk='
 
 function makeFetch(opts: { captureStatus?: number } = {}) {
   const calls: string[] = []
@@ -168,11 +180,16 @@ describe('RC-55: a capture failure names its cause', () => {
       expect(panel.captureFrame).not.toHaveBeenCalled()
     })
 
-    it('stops waiting when a LIVE stream dies mid-call', async () => {
-      // The second wait, not the readiness one. A call can begin against a
-      // perfectly good stream and lose the device part-way through — another
-      // application takes it — and the frame wait would then spend the whole
-      // remaining budget on a camera that has already reported why it stopped.
+    it('stops waiting when the camera is LOST mid-call', async () => {
+      // The second wait, not the readiness one. A call can begin against a good
+      // stream and lose the camera part-way through — the student presses Retry
+      // and permission is now refused — and the frame wait would then spend the
+      // whole remaining budget on a camera that has already said why it stopped.
+      //
+      // The mid-call flip sets isActive AND the status together, because that is
+      // what PkWebcamPanel does: every terminal status is assigned in the same
+      // catch block that sets isActive false. A fake that dropped only the
+      // status would be pinning a panel state the real component cannot reach.
       vi.useFakeTimers()
       try {
         const panel = makePanel({ status: 'live', isActive: true, neverDecodes: true })
@@ -186,12 +203,13 @@ describe('RC-55: a capture failure names its cause', () => {
         // exactly what the deadline is for.
         expect(settled).toEqual([])
 
-        panel.cameraStatus = 'busy'
+        panel.isActive = false
+        panel.cameraStatus = 'denied'
         await vi.advanceTimersByTimeAsync(5)
 
         // Answered at ~55 ms of a 1000 ms budget.
         expect(settled).toHaveLength(1)
-        expect(JSON.parse(settled[0])).toEqual({ error: BUSY_MESSAGE })
+        expect(JSON.parse(settled[0])).toEqual({ error: DENIED_MESSAGE })
       } finally {
         vi.useRealTimers()
       }
@@ -220,6 +238,35 @@ describe('RC-55: a capture failure names its cause', () => {
         await vi.advanceTimersByTimeAsync(20)
         expect(settled).toHaveLength(1)
         expect(JSON.parse(settled[0])).toEqual({ error: STARTING_MESSAGE })
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('an IDLE camera still gets the whole deadline, then names that', async () => {
+      // `idle` is the state between the panel mounting and its getUserMedia call
+      // being dispatched, so failing fast on it reinstates the exact race RC-53
+      // measured and closed (stream live at 133 ms, a capture issued at 110 ms
+      // losing by 23 ms). worlds.ts makes its most emphatic anti-simplification
+      // claim about this status, and this is the spec that refuses the
+      // simplification: adding 'idle' to CAMERA_STATUSES_THAT_CANNOT_IMPROVE
+      // turns it red. Without it, that widening passes the whole suite.
+      vi.useFakeTimers()
+      try {
+        const panel = makePanel({ status: 'idle' })
+        const { session } = sessionOver(panel, { cameraReadyTimeoutMs: 100 })
+
+        const settled: string[] = []
+        void session.captureImage().then((r) => settled.push(r))
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(settled).toEqual([])
+        await vi.advanceTimersByTimeAsync(90)
+        expect(settled).toEqual([])
+
+        await vi.advanceTimersByTimeAsync(20)
+        expect(settled).toHaveLength(1)
+        expect(JSON.parse(settled[0])).toEqual({ error: IDLE_MESSAGE })
       } finally {
         vi.useRealTimers()
       }
@@ -318,9 +365,10 @@ describe('RC-55: a capture failure names its cause', () => {
       const { session, calls } = sessionOver(panel, { worldId: 'simulated' })
 
       const out = JSON.parse(await session.captureImage())
+      // 'SEk=' is base64 'HI', the bytes the fake server serves, computed
+      // independently of the encoder under test.
       expect(out).toEqual({ mimeType: 'image/jpeg', data: 'SEk=' })
       expect(calls).toEqual(['http://127.0.0.1:9099/capture'])
-      expect(SNAPSHOT_DATA_URL).toBe('data:image/jpeg;base64,SEk=')
     })
 
     it('does not blame the camera when a simulated capture FAILS', async () => {
