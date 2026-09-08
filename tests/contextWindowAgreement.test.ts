@@ -135,7 +135,12 @@ describe('RC-62 — contextWindowWarning', () => {
     // is the defect: a reader who does exactly that still truncates, and this
     // check then goes silent on the result.
     expect(warning).toContain(`Raise llm.ollama.numCtx to at least ${REQUIRED}`)
-    expect(warning).not.toContain('at least 30000')
+    // Anchored on the remedy verb, not on the bare number. `maxContextTokens=30000`
+    // appears legitimately in the requirement clause, so an unanchored
+    // `not.toContain('at least 30000')` would pass today by an accident of
+    // wording and red on a correct implementation that rephrased that clause.
+    // The defect lived in the remedy, so that is what this pins.
+    expect(warning).not.toMatch(/Raise llm\.ollama\.numCtx to at least 30000/)
     // On this path there is no config file, so the two keys the remedy names
     // may not exist to edit; the one lever that path has must appear as a
     // remedy and not only in the condition clause.
@@ -295,9 +300,13 @@ describe('RC-62 — contextWindowWarning', () => {
 
     const warning = warn('huge-prompt', localProfile({ systemPromptPath: 'huge-prompt.md' }))
 
+    // Omitting the clause is the whole assertion: there is no negative number to
+    // print if the sentence offering it is not built. A broader "no hyphen
+    // followed by a digit anywhere in the message" tripwire was tried and
+    // dropped — it would red on any future wording containing a version string
+    // or a range, which is not what this cell is about.
     expect(warning).toContain('needs a window of at least 40000 tokens')
     expect(warning).not.toContain('lower contextPruner.maxContextTokens')
-    expect(warning).not.toMatch(/-\d/)
   })
 
   it('says nothing about a hosted profile, which has no num_ctx to compare', () => {
@@ -504,6 +513,33 @@ describe('RC-62 — the shipped local profiles', () => {
       'see the margin assertion in the next cell for the numbers and the remedy'
     expect(contextWindowWarning('gemma-default', local['gemma-default']), guidance).toBeNull()
     expect(contextWindowWarning('gemma-tuned', local['gemma-tuned']), guidance).toBeNull()
+  })
+
+  it('measures a shipped profile against the prompt file it is POINTED AT, not the default one', () => {
+    // Every other cell in this group reads the real `system-prompt.md`, so none
+    // of them can tell a derived headroom from a constant that happens to equal
+    // that file's token count — substituting the literal 1887 into the check
+    // leaves this whole group green (measured). This is the cell that tells them
+    // apart at the repo root: the shipped profile, the shipped window,
+    // redirected at a much larger real file.
+    //
+    // `AGENTS.md` stands in for an oversized prompt. Its size is asserted FIRST,
+    // so that if it ever shrinks below the shipped margin this cell fails saying
+    // so, rather than passing while testing nothing.
+    const bigTokens = Math.ceil(readFileSync('AGENTS.md', 'utf8').length / 4)
+    expect(
+      bigTokens,
+      'AGENTS.md no longer overruns the shipped window, so this cell would pass without ' +
+        'discriminating a derived headroom from a constant. Point it at a larger tracked file.'
+    ).toBeGreaterThan(32_768 - 30_000)
+
+    const warning = contextWindowWarning('gemma-default-big-prompt', {
+      ...local['gemma-default'],
+      systemPromptPath: 'AGENTS.md',
+    })
+
+    expect(warning).toContain(`needs a window of at least ${30_000 + bigTokens} tokens`)
+    expect(warning).toContain('AGENTS.md')
   })
 
   it('the shipped window still covers the live system-prompt.md, and names the slack when it stops', () => {
