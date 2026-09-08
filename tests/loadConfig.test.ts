@@ -1,10 +1,16 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadConfig } from '../server/loadConfig.js'
 
 let tmpDir: string
+let warnSpy: ReturnType<typeof vi.spyOn>
+
+/** Every `console.warn` this spec's `loadConfig` call produced, in order. */
+function warnings(): string[] {
+  return warnSpy.mock.calls.map((call: unknown[]) => String(call[0]))
+}
 const ENV_KEYS = [
   'PUKEKO_PROFILE',
   'LLM_PROVIDER',
@@ -17,22 +23,43 @@ const ENV_KEYS = [
   'PUKEKO_VERBOSE',
 ] as const
 
+// RC-63. Most profiles in this file are ollama with no `numCtx`, written before
+// RC-62's window check existed and kept deliberately minimal — so nearly every
+// spec here now emits a context-window warning that is perfectly true and has
+// nothing to do with what the spec is testing. It is CAPTURED rather than
+// silenced: discarding it would leave a future spec that wants to assert on
+// stderr looking at a mock with no history, and leaving it on stderr trains a
+// reader to skim past the one run where it matters. `warnings()` above is what
+// a spec reads to make an assertion about it, and the PUKEKO_PROFILE spec below
+// does exactly that.
+//
+// It is deliberately NOT fixed by giving these profiles a window. Their subject
+// is profile selection and env overrides; a `numCtx` on each would be noise in
+// the fixture, and the no-config path's own window is asserted in
+// `tests/contextWindowAgreement.test.ts`, where the check is the subject.
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'pukeko-cfg-'))
   for (const k of ENV_KEYS) delete process.env[k]
+  warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 })
 
 afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true })
   for (const k of ENV_KEYS) delete process.env[k]
+  vi.restoreAllMocks()
 })
 
 describe('loadConfig', () => {
   it('falls back to gemma4 when no config file is present', async () => {
+    // RC-63: 12b, not 31b. The fallback is a floor — chosen for the weakest
+    // machine that should still work, since the user who reaches it configured
+    // nothing — and it now matches the model AGENTS.md and the example config
+    // both name. The reasoning lives beside `FALLBACK_PROFILE`; the window that
+    // comes with the model is asserted in `tests/contextWindowAgreement.test.ts`.
     const resolved = await loadConfig(tmpDir)
     expect(resolved.configPath).toBeNull()
     expect(resolved.profile.llm.provider).toBe('ollama')
-    expect(resolved.profile.llm.model).toBe('gemma4:31b')
+    expect(resolved.profile.llm.model).toBe('gemma4:12b')
   })
 
   it('RC-16: the no-config fallback profile uses context-pruner, never motion-summary', async () => {
@@ -133,6 +160,15 @@ describe('loadConfig', () => {
     process.env.PUKEKO_PROFILE = 'does-not-exist'
     const resolved = await loadConfig(tmpDir)
     expect(resolved.profileName).toBe('a')
+    // The spec is named for a warning it never read. Matched among all the
+    // calls rather than as the only one: this profile is ollama with no window,
+    // so RC-62's check speaks here too, and pinning a call COUNT would make an
+    // unrelated warning fail a spec about profile selection.
+    expect(warnings()).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("PUKEKO_PROFILE='does-not-exist' not found; falling back to 'a'"),
+      ])
+    )
   })
 
   it('rejects config without a profiles object', async () => {

@@ -4,9 +4,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ChatOllama } from '@langchain/ollama'
 import { convertToOpenAITool } from '@langchain/core/utils/function_calling'
-import { contextWindowWarning, loadConfig } from '../server/loadConfig.js'
+import { FALLBACK_PROFILE, contextWindowWarning, loadConfig } from '../server/loadConfig.js'
 import { createLlm } from '../server/createLlm.js'
 import { createRobotTools } from '../src/agent/robotTools.js'
+import { DEFAULT_MAX_CONTEXT_TOKENS } from '../src/agent/contextPrunerMiddleware.js'
 import type { PukekoProfile } from '../src/lib/config.js'
 import exampleConfig from '../pukeko.config.example.js'
 
@@ -521,20 +522,76 @@ describe('RC-62 — the check is installed in loadConfig', () => {
     )
   })
 
-  it('still offers OLLAMA_CONTEXT_LENGTH on the path that really has no config file', async () => {
-    // Firing two, and the control for the cell above: an empty directory, so
-    // `loadConfig` falls back to FALLBACK_CONFIG and there genuinely is no file
-    // to edit. The reworded sentence has to keep working here — a fix that made
-    // the first cell pass by deleting the env-var remedy would strand exactly
-    // the reader who has no other lever.
+  it('RC-63: firing two is now unreachable — the no-config path sets its own window', async () => {
+    // This cell used to be firing two: an empty directory, so `loadConfig` fell
+    // back to FALLBACK_CONFIG, there genuinely was no file to edit, and the
+    // env-var remedy had to survive there. RC-63 gave `FALLBACK_PROFILE` a
+    // window, so that firing no longer exists — the no-config path is the one
+    // path whose profile this repo chooses, and it now chooses a window that
+    // agrees with the budget.
+    //
+    // WHERE THE ENV-VAR SENTENCE IS STILL PROVED, since this cell no longer does
+    // it: the branch itself in the first group (`reports a profile that sends no
+    // num_ctx`), and end to end in the cell directly above, which is the firing
+    // that remains — a config file with an ollama profile that omits
+    // `llm.ollama`. The sentence stays correct there because it is a conditional
+    // about a run with no file to edit, not a claim that this run has none.
+    //
+    // The assertion here is deliberately the WEAK form: this tmpdir has no
+    // `system-prompt.md`, so the requirement is the bare budget and this would
+    // pass at any window ≥ 30000 — including one below the real floor. The
+    // acceptance that measures a fresh checkout properly is in the RC-63 group
+    // below, which puts a real prompt file on the path.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     const resolved = await loadConfig(tmpDir)
     expect(resolved.configPath).toBeNull()
 
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('RC-63: checks AFTER the env overrides, so a hosted profile flipped to ollama is reported', async () => {
+    // The ordering `loadConfig` documents, pinned. Moving the call above
+    // `applyEnvOverrides` survives every other cell in this file and the whole
+    // suite, because every other cell reaches the check with a profile the
+    // overrides do not touch.
+    //
+    // `LLM_PROVIDER` is the only override the check can see — it never reads
+    // `llm.model`, so `OLLAMA_MODEL` is invisible to it — and it lands on the
+    // check's very first line. Against the pre-override profile this returns
+    // null on `provider !== 'ollama'` and says nothing, while the run that
+    // actually happens is ollama with no window against a 130000 budget: the
+    // largest disagreement this check can encounter, reported as silence.
+    writeConfig({
+      llm: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      contextPruner: { maxContextTokens: 130_000 },
+    })
+    process.env.LLM_PROVIDER = 'ollama'
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const resolved = await loadConfig(tmpDir)
+    expect(resolved.profile.llm.provider).toBe('ollama')
+
+    expect(warn).toHaveBeenCalledTimes(1)
     const message = String(warn.mock.calls[0]?.[0])
     expect(message).toContain('sends no llm.ollama.numCtx')
-    expect(message).toContain('OLLAMA_CONTEXT_LENGTH on the ollama server raises the default')
+    expect(message).toContain('maxContextTokens=130000')
+  })
+
+  it('says nothing about that same hosted profile when nothing overrides the provider', async () => {
+    // The control for the cell above, and the half that makes it about ORDERING
+    // rather than about hosted profiles. Same file, same budget, no
+    // `LLM_PROVIDER`: the check must stay silent, or the cell above would pass
+    // under a check that warns on everything.
+    writeConfig({
+      llm: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      contextPruner: { maxContextTokens: 130_000 },
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    await loadConfig(tmpDir)
+
+    expect(warn).not.toHaveBeenCalled()
   })
 })
 
@@ -555,6 +612,18 @@ function wireBody(llm: unknown): unknown {
  * of them: it changes what the model can SEE, not how it draws tokens. So it
  * belongs on the equal side of the A/B comparison, along with everything outside
  * that bag.
+ *
+ * **It rebuilds the bag from `numCtx` alone, so it is BLIND to any other
+ * non-sampling `llm.ollama` key** — a `keepAlive` or a `format` set on one
+ * profile and not the other vanishes from both sides and the A/B cell below
+ * passes. What catches those is the whole-body `wireBody` assertion in the first
+ * two cells of this group, which compares the entire request object by value.
+ *
+ * **So do NOT delete those wire cells on the grounds that the A/B cell subsumes
+ * them.** It does not, in either direction: a reviewer measured the two catching
+ * different mutations, and this helper is exactly why. Adding a non-sampling key
+ * to the bag means widening this helper as well, or the difference it makes is
+ * asserted nowhere.
  */
 function withoutSamplingOptions(profile: PukekoProfile): PukekoProfile {
   return {
@@ -723,7 +792,7 @@ describe('RC-62 — the shipped local profiles', () => {
     ).toBeGreaterThanOrEqual(0)
   })
 
-  it('the two local profiles differ ONLY in their sampling options', () => {
+  it('the two local profiles differ ONLY in their sampling options — see the helper note above', () => {
     // RC-50 shipped `gemma-tuned` as a controlled A/B partner for
     // `gemma-default`: run one against the other and the only variable is how
     // the model samples. Setting a window on one and not the other would
@@ -733,6 +802,155 @@ describe('RC-62 — the shipped local profiles', () => {
     // one profile alone.
     expect(withoutSamplingOptions(local['gemma-tuned'])).toEqual(
       withoutSamplingOptions(local['gemma-default'])
+    )
+  })
+})
+
+/**
+ * RC-63 — the profile a checkout with NO config file runs.
+ *
+ * This is the configuration nobody chose, running on a machine nobody tuned, and
+ * until this group existed it was the one profile in the repo that no cell
+ * measured. Every RC-62 cell above builds its profile inline, and the two
+ * fallback cells in `tests/loadConfig.test.ts` read `configPath`, `provider`,
+ * `model` and `middleware` and never the window — so the fallback shipped a model
+ * that did not fit and a window five times too small while the whole suite was
+ * green, and RC-62's own new warning then fired on it at every startup.
+ *
+ * **The cheap version of the acceptance does not work, and the reason is worth
+ * keeping.** `loadConfig(emptyTmpDir)` plus `expect(warn).not.toHaveBeenCalled()`
+ * reads like a fresh checkout and is not one: that root holds no
+ * `system-prompt.md`, so the prompt term is zero, the requirement collapses to
+ * the bare budget, and the assertion passes at any window ≥ 30000 — including
+ * 30000 itself, which is below the real floor and is precisely the configuration
+ * RC-62 exists to report. An assertion that cannot fail on the defect it is named
+ * for. So both cells below put a REAL prompt on the path the loader resolves
+ * from: the pure-function one at the repo root, the end-to-end one by copying the
+ * live file into the tmpdir.
+ */
+describe('RC-63 — the no-config fallback profile', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'pukeko-rc63-'))
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('is silent against the repo real system-prompt.md — the acceptance', () => {
+    // No root argument, so this reads the live `system-prompt.md` at the repo
+    // root — the same file, on the same path, that a contributor's config-less
+    // `pnpm run server` will load. Red before RC-63: 4096 against 30000.
+    expect(
+      contextWindowWarning('default', FALLBACK_PROFILE),
+      'the no-config fallback no longer covers maxContextTokens plus the live system-prompt.md. ' +
+        'A fresh checkout would warn about the repo own default. Raise numCtx on FALLBACK_PROFILE ' +
+        'in server/loadConfig.ts — and see the floor cell below for the term the check cannot see.'
+    ).toBeNull()
+  })
+
+  it('starts silent end to end, with the real prompt file on the loader path', async () => {
+    // The acceptance through `loadConfig` rather than through the pure function:
+    // an empty directory, so `FALLBACK_CONFIG` is what resolves, plus a copy of
+    // the live prompt so the requirement is the production one (~31887) and not
+    // the bare budget. Reds if the fallback's window is removed, and reds if the
+    // check stops being called with the loader's own root.
+    writeFileSync(join(tmpDir, 'system-prompt.md'), readFileSync('system-prompt.md', 'utf8'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const resolved = await loadConfig(tmpDir)
+
+    expect(resolved.configPath).toBeNull()
+    expect(resolved.profile.llm.model).toBe('gemma4:12b')
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('WARNS through the fallback when the prompt outgrows the window — the capture proof', async () => {
+    // The cell that makes the two above mean something. `not.toHaveBeenCalled()`
+    // passes just as well when the spy is never wired, when `loadConfig` never
+    // reaches the check, and when the guard is unreachable through
+    // `FALLBACK_PROFILE` at all — which was the true state of this repo before
+    // RC-63. This is the same path, the same profile and the same spy, with a
+    // prompt file big enough to overrun the shipped window: 200000 characters is
+    // 50000 tokens, so the requirement is 80000 against a window of 49152.
+    //
+    // It also pins that the fallback reaches the check as a profile that SETS a
+    // window — `sets llm.ollama.numCtx=49152`, not the absent-key branch — which
+    // is the difference RC-63 made.
+    writeFileSync(join(tmpDir, 'system-prompt.md'), 'x'.repeat(200_000))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const resolved = await loadConfig(tmpDir)
+    expect(resolved.configPath).toBeNull()
+
+    expect(warn).toHaveBeenCalledTimes(1)
+    const message = String(warn.mock.calls[0]?.[0])
+    expect(message).toContain(`sets llm.ollama.numCtx=${FALLBACK_PROFILE.llm.ollama?.numCtx}`)
+    expect(message).toContain('needs a window of at least 80000 tokens')
+  })
+
+  it('asks ollama for that window on the wire, under the model it chose', () => {
+    // Whole-body equality, written out by hand for the same reason as the
+    // shipped-profile cells: a `numCtx` the config layer holds but the request
+    // never carries is the defect one layer down, and only the wire body can
+    // tell those apart. This is also the by-value pin on the fallback model.
+    const { provider, llm } = createLlm(FALLBACK_PROFILE.llm)
+
+    expect(provider).toBe('ollama')
+    expect(wireBody(llm)).toEqual({
+      model: 'gemma4:12b',
+      options: { num_ctx: 49152 },
+    })
+  })
+
+  it('covers its real floor, including the bound tools the check cannot see', () => {
+    // The fallback's version of the shipped-profile floor cell, and it is the
+    // one that would have caught RC-62's near-miss on this profile: clearing
+    // `contextWindowWarning` is a LOWER bound, because the bound tool set belongs
+    // to whoever builds the agent and the config cannot size it.
+    //
+    // The budget here is IMPORTED rather than written out, and that is the
+    // opposite of the choice the shipped-profile cells make — deliberately. Those
+    // profiles state `maxContextTokens` themselves, so a constant is what pins
+    // them. This profile states none, so the budget in force IS the middleware's
+    // default: raising `DEFAULT_MAX_CONTEXT_TOKENS` silently raises what the
+    // fallback needs, and this cell should red when it does.
+    const promptTokens = Math.ceil(readFileSync('system-prompt.md', 'utf8').length / 4)
+    const toolSpecChars = createRobotTools('192.168.4.1')
+      .map((t) => JSON.stringify(convertToOpenAITool(t)).length)
+      .reduce((a, b) => a + b, 0)
+    const toolTokens = Math.ceil(toolSpecChars / 4)
+    const floor = DEFAULT_MAX_CONTEXT_TOKENS + promptTokens + toolTokens
+    const shipped = FALLBACK_PROFILE.llm.ollama?.numCtx ?? 0
+
+    // Guard: if the tools ever serialise to nothing, the margin below would pass
+    // while measuring an empty set.
+    expect(toolTokens, 'no tool specs were measured, so this cell proves nothing').toBeGreaterThan(
+      0
+    )
+
+    expect(
+      shipped - floor,
+      `the no-config fallback window of ${shipped} no longer covers its real floor of ${floor} = ` +
+        `${DEFAULT_MAX_CONTEXT_TOKENS} pruner default + ${promptTokens} system prompt + ` +
+        `${toolTokens} bound tool specs. A fresh checkout would truncate from the head and ` +
+        `contextWindowWarning would NOT report it — it counts the first two terms only and says ` +
+        `so. Raise numCtx on FALLBACK_PROFILE in server/loadConfig.ts.`
+    ).toBeGreaterThanOrEqual(0)
+  })
+
+  it('runs the same model the example config and AGENTS.md name — one answer, not three', () => {
+    // The disagreement RC-63 exists to end. The fallback said `gemma4:31b` while
+    // `pukeko.config.example.ts` and AGENTS.md both said `gemma4:12b`, so a
+    // reader who opened the example and a reader who just ran the server got
+    // different answers about what a local run is. Pinned against the example
+    // config rather than a literal: the two are one decision, and a future
+    // change to one of them should have to look at the other.
+    expect(FALLBACK_PROFILE.llm.model).toBe(exampleConfig.profiles['gemma-default'].llm.model)
+    expect(FALLBACK_PROFILE.llm.ollama?.numCtx).toBe(
+      exampleConfig.profiles['gemma-default'].llm.ollama?.numCtx
     )
   })
 })

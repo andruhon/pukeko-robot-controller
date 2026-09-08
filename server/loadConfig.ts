@@ -30,8 +30,53 @@ export const DEFAULT_MIDDLEWARE: readonly MiddlewareEntry[] = [
   'context-pruner',
 ];
 
+/**
+ * The profile a checkout with no config file runs.
+ *
+ * **A fallback is a floor, not a recommendation** — it is chosen for the weakest
+ * machine that should still work, because the one user who reaches it is by
+ * definition the user who configured nothing. `gemma4:12b` at a `numCtx` of
+ * 49152 is the same pair the example profiles ship, so the repo gives one answer
+ * about what a local run is.
+ *
+ * **Why the smaller model, when this decides what runs on ANY machine.**
+ * `gemma4:31b` is ~21.5 GB loaded — that is a property of the model, identical
+ * everywhere, and only the card decides whether it fits. Under about 22 GiB it
+ * spills to the CPU, and widening the window makes the spill worse because KV
+ * cache displaces weights, so even a 24 GiB card holds it only barely at the
+ * window below. Measured on the dev box (Radeon RX 9060 XT, 15.9 GiB): a third
+ * of 31b on the CPU and 17–19 s to first token, against 12b loading whole at
+ * 9.2 GB and ~4 s. Nothing has measured 31b fitting anything.
+ *
+ * The two mistakes are not symmetric. Too small costs answer quality on a big
+ * machine, and that machine opts up with `OLLAMA_MODEL=gemma4:31b` — one env var,
+ * no config file needed. Too large costs a small machine a run that looks hung,
+ * with nothing on screen saying why.
+ *
+ * **The cost of this choice, for whoever is choosing.** On a card too small for
+ * 12b — under roughly 10 GiB once the window below is allocated — the model
+ * spills to the CPU and first token takes many seconds. The window is the first
+ * number to bring down there, and it has to come down TOGETHER with
+ * `contextPruner.maxContextTokens`: they are one decision, and lowering the
+ * window alone is the exact disagreement `contextWindowWarning` below exists to
+ * report. So the remedy on a small machine is a config file (copy
+ * `pukeko.config.example.ts`), not an env var. Note that setting `numCtx` here
+ * also means `OLLAMA_CONTEXT_LENGTH` no longer reaches a no-config run: an
+ * explicit `num_ctx` in the request overrides the server default. That lever
+ * only ever let this path change one of the two numbers, which is why losing it
+ * is a cost worth paying rather than a regression.
+ *
+ * **49152 rather than the bare floor**, for the reason written out beside the
+ * example profiles: the floor is `maxContextTokens` + the system prompt + the
+ * bound tool descriptions, and the check below can only see the first two. A
+ * window sized to what the check asks for can still truncate.
+ */
 const FALLBACK_PROFILE: PukekoProfile = {
-  llm: { provider: 'ollama', model: 'gemma4:31b' },
+  llm: {
+    provider: 'ollama',
+    model: 'gemma4:12b',
+    ollama: { numCtx: 49152 },
+  },
   middleware: [...DEFAULT_MIDDLEWARE],
 };
 
@@ -215,9 +260,14 @@ function systemPromptTokens(profile: PukekoProfile, root: string): number | null
  * `context-pruner` absent from the stack, `contextPruner` on the profile is
  * inert and there is no second opinion to disagree with.
  *
- * It warns rather than throwing. The disagreeing shape is what a fresh checkout
- * with no config file produces (no `llm.ollama` block at all), so refusing to
- * start would turn a degraded run into no run.
+ * It warns rather than throwing, and RC-63 did not change that. The reason has
+ * moved, though: the disagreeing shape used to be what a fresh checkout with no
+ * config file produced, and `FALLBACK_PROFILE` now sets a window that agrees, so
+ * this no longer fires on the repo's own default. What it still fires on is a
+ * config file someone wrote — the commonest shape being an ollama profile with
+ * no `llm.ollama` block — and turning that into a startup failure would make a
+ * degraded run no run at all, on a configuration whose owner may well have
+ * raised the window on the server instead.
  */
 export function contextWindowWarning(
   profileName: string,
@@ -303,8 +353,17 @@ export function contextWindowWarning(
     (loweredBudget > 0
       ? `, or lower contextPruner.maxContextTokens to ${loweredBudget} or less.`
       : `.`) +
-    // OLLAMA_CONTEXT_LENGTH is the one lever a run with no config file has, and
-    // it appeared only in the condition clause above, so offer it here too.
+    // OLLAMA_CONTEXT_LENGTH appeared only in the condition clause above, so it
+    // is offered here as a remedy too.
+    //
+    // RC-63: it is no longer THIS repo's no-config lever. `FALLBACK_PROFILE`
+    // now sends an explicit `num_ctx`, which overrides the server default, so a
+    // run with no config file neither needs that env var nor is affected by it —
+    // and cannot reach this branch at all. The sentence stays because it is a
+    // conditional, not a claim about the current run: this function is handed a
+    // profile and a root, never a `configPath`, so it cannot know which case it
+    // is in, and any caller that builds an ollama profile with no window and no
+    // file to edit still has exactly this one lever.
     //
     // But this branch is gated on an unset `numCtx`, NOT on the absence of a
     // config file — the two are different conditions and this function is never
@@ -355,10 +414,18 @@ export async function loadConfig(cwd: string = process.cwd()): Promise<ResolvedC
   }
 
   const profile = applyEnvOverrides(cfg.profiles[profileName]);
-  // RC-62. Checked AFTER the env overrides, since one of them can change the
-  // model. Once per process without a dedupe set, unlike the pruner's
-  // once-per-thread warning: this runs at config load, which happens once per
-  // server start, so the "once" is the call site rather than bookkeeping.
+  // RC-62. Checked AFTER the env overrides, and the reason is the PROVIDER, not
+  // the model: this check never reads `llm.model`. `LLM_PROVIDER` is the one
+  // override that reaches it, and it reaches the very first line — a hosted
+  // profile flipped to ollama has no `num_ctx` to compare and must be reported,
+  // while the check run against the pre-override profile would return null on
+  // the hosted provider and say nothing. The ordering is pinned by a spec in
+  // `tests/contextWindowAgreement.test.ts`; moving this line above
+  // `applyEnvOverrides` reds it.
+  //
+  // Once per process without a dedupe set, unlike the pruner's once-per-thread
+  // warning: this runs at config load, which happens once per server start, so
+  // the "once" is the call site rather than bookkeeping.
   const windowWarning = contextWindowWarning(profileName, profile, cwd);
   if (windowWarning) console.warn(windowWarning);
   return { configPath, profileName, profile };
