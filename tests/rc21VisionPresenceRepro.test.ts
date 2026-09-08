@@ -42,6 +42,12 @@ import {
 
 const B64 = 'BASE64IMAGEDATA_deadbeef'
 
+// The pruner keeps module-level per-thread state (see `__unsummarizableThreadsForTest`),
+// so a thread id has to be unique for the life of the process. `Date.now()` is not:
+// two calls in the same millisecond return the same number. The counter is what makes
+// it a key, matching `tests/rc21CrossCoreToolMessage.test.ts`.
+let nonce = 0
+
 // ── Message summary helpers (snapshot at capture time; middleware reuses objects) ──
 interface MsgSummary {
   type: string
@@ -576,7 +582,7 @@ describe('RC-21/RC-58 — vision presence for a foreign-copy inbound history', (
   })
 
   it('a foreign-copy capture result still reaches the model as a vision block', async () => {
-    const uid = `fc-${Date.now()}`
+    const uid = `fc-${Date.now()}-${nonce++}`
     const out = await runChain(foreignCaptureHistory(uid), uid)
 
     // The golden failure was human-images:0. This is the number that goes back
@@ -595,7 +601,7 @@ describe('RC-21/RC-58 — vision presence for a foreign-copy inbound history', (
   })
 
   it('counts and ages out a foreign-copy vision HumanMessage already in the history', async () => {
-    const uid = `fh-${Date.now()}`
+    const uid = `fh-${Date.now()}-${nonce++}`
     // An earlier turn's injected frame, as it comes back in from the other copy,
     // ahead of a fresh native capture turn.
     const olderForeignFrame = foreignHumanMessage({

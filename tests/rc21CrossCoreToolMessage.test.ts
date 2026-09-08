@@ -1,22 +1,39 @@
 // RC-21 (golden fix) — the vision block must be injected for a capture
-// ToolMessage that crosses the @langchain/core package boundary.
+// ToolMessage that the class-based check cannot recognise.
 //
-// The robot resolves TWO @langchain/core copies at runtime: its own, plus the
-// one pulled in transitively by the `@gaunt-sloth/*` `file:` deps. A
-// `capture_image` result constructed inside gaunt-sloth's AG-UI pipeline is
-// therefore an instance of THAT copy's `ToolMessage` class — not the class this
-// repo imports. The original guard `msg instanceof ToolMessage` silently
-// returned false for it, so no frame was ever injected on the real server
-// (observability showed tool-data:1 / human-images:0 / imageCount:0), while the
-// context-pruner — which uses core's duck-typed `isToolMessage` — matched the
-// same message fine. This pins the fix: FI now uses `isToolMessage`, so a
-// foreign-copy ToolMessage still injects.
+// WHAT THIS FIXTURE ACTUALLY PINS: marker-absence. `@langchain/core`'s message
+// classes answer `instanceof` through `static [Symbol.hasInstance]`, which
+// delegates to a duck test keyed on the global-registry symbol
+// `Symbol.for('langchain.message')`. So an object that carries the marker passes
+// `instanceof` whatever its prototype, and an object that does NOT carry it —
+// like the plain-duck one built below — fails `instanceof` while satisfying
+// `isToolMessage()`. That is the condition this file pins, and it is the shape a
+// message rebuilt from the wire, or built by a core older than the marker,
+// arrives in. It says nothing about which copy of core built anything: nothing
+// available to this test can distinguish that, and an earlier version of this
+// header claiming otherwise was wrong.
+//
+// WHERE THE COST WAS REAL: when the robot genuinely resolved two @langchain/core
+// copies — its own plus one pulled in transitively — a `capture_image` result
+// constructed by the other copy was not an instance of the `ToolMessage` class
+// this repo imports. The original guard `msg instanceof ToolMessage` silently
+// returned false for it, so no frame was ever injected on the real server;
+// observability showed tool-data:1 / human-images:0 / imageCount:0, measured
+// under those two-copy conditions. The context-pruner, which uses core's
+// duck-typed `isToolMessage`, matched the same message fine. This pins the fix:
+// FI uses `isToolMessage`, so a message the class check cannot see still
+// injects.
 //
 // This is a MUTATION-CHECKED pin: reverting FI's guard back to
-// `msg instanceof ToolMessage` makes the foreign message fail the scan and this
-// test's "was a vision HumanMessage injected?" assertion fails. (The prior
-// RC-21 repro used real ToolMessage instances from THIS copy, so instanceof
-// passed there — which is exactly why it could not catch this bug.)
+// `msg instanceof ToolMessage` makes the fixture fail the scan and this test's
+// "was a vision HumanMessage injected?" assertion fails. (The prior RC-21 repro
+// used real ToolMessage instances from THIS copy, so instanceof passed there —
+// which is exactly why it could not catch this bug.)
+//
+// It is also the deliberate exemption in `tests/messageClassInstanceofGuard.test.ts`
+// and must NOT be converted to the duck-typed spelling: its `instanceof`
+// assertion is the only direct pin on the condition the whole rule exists for,
+// and that guard asserts the exemption is still being used.
 import { describe, it, expect } from 'vitest'
 import {
   AIMessage,
@@ -42,10 +59,11 @@ function getBeforeModel(mw: unknown): (s: unknown, r: unknown) => Promise<unknow
 }
 
 // A ToolMessage-shaped message that is NOT an instance of the `ToolMessage`
-// class this repo imports — the shape a message built by gaunt-sloth's *other*
-// @langchain/core copy presents across the `file:`-dep boundary. It satisfies
-// core's duck-typed `isToolMessage()` (has a `getType()` returning 'tool') but
-// fails `instanceof ToolMessage`.
+// class this repo imports, because it carries no `Symbol.for('langchain.message')`
+// marker. Plain-duck construction is what produces that: re-prototyping a real
+// message does not, since the marker rides along on the object and `instanceof`
+// keeps passing. It satisfies core's duck-typed `isToolMessage()` (has a
+// `getType()` returning 'tool') but fails `instanceof ToolMessage`.
 function foreignCoreToolMessage(fields: {
   content: string
   tool_call_id: string

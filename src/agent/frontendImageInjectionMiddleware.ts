@@ -87,14 +87,16 @@ export function createFrontendImageInjectionMiddleware(opts: ImageInjectionOptio
       for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
         if (
-          // RC-21 (golden fix): the robot resolves two @langchain/core copies
-          // (its own + gaunt-sloth's, via the `file:` deps), so a capture
-          // ToolMessage constructed by the AG-UI pipeline's core copy is NOT an
-          // instance of the `ToolMessage` class WE import — `msg instanceof
-          // ToolMessage` silently returned false on the real server and no frame
-          // was ever injected (pruner's duck-typed `isToolMessage` saw it fine,
-          // hence tool-data:1 / human-images:0 in the dumps). Use the same
-          // cross-copy-safe guard the pruner uses.
+          // RC-21 (golden fix): a capture ToolMessage does not always answer to
+          // the `ToolMessage` class WE import. `msg instanceof ToolMessage`
+          // silently returned false on the real server and no frame was ever
+          // injected (the pruner's duck-typed `isToolMessage` saw it fine, hence
+          // tool-data:1 / human-images:0 in the dumps) — measured when the robot
+          // resolved two @langchain/core copies, which it no longer does. The
+          // class check is unreliable here regardless: core answers `instanceof`
+          // through a duck test keyed on `Symbol.for('langchain.message')`, so a
+          // result rebuilt from the wire without that marker fails it just the
+          // same. Use the duck-typed guard the pruner uses.
           isToolMessage(msg) &&
           typeof msg.content === 'string' &&
           (msg.name === 'capture_image' || (msg.name && MOTION_NAMES.has(msg.name)))
