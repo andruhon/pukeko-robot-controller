@@ -143,8 +143,15 @@ function applyEnvOverrides(profile: PukekoProfile): PukekoProfile {
 }
 
 /**
- * Tokens the system prompt will cost, on the pruner's own scale — or 0 when no
- * prompt file can be read.
+ * Tokens the system prompt will cost, on the pruner's own scale — or `null`
+ * when no prompt file can be read.
+ *
+ * **`null` and 0 are different facts, so they are different return values.**
+ * `null` means the file could not be read and the real cost is unknown, above
+ * whatever is counted; 0 means the file was read and is empty, so the prompt
+ * genuinely costs nothing. Both once returned 0, which made the caller describe
+ * an empty file as unreadable — a false statement about a configuration that is
+ * fine.
  *
  * The prompt is the piece the budget arithmetic below was missing.
  * `estimateTokens` sums over `state.messages` only, and the composed prompt is
@@ -162,17 +169,17 @@ function applyEnvOverrides(profile: PukekoProfile): PukekoProfile {
  * sloth resolves the `prompts.guidelines` path itself, so this reads the file it
  * is pointed at rather than mirroring that resolution.
  *
- * Unreadable — absent, a directory, no permission — yields 0 rather than
+ * Unreadable — absent, a directory, no permission — yields `null` rather than
  * throwing. A missing prompt file must not turn a startup warning into a startup
  * failure, and the caller says so in the text when it happens instead of
  * printing a number it could not compute.
  */
-function systemPromptTokens(profile: PukekoProfile, root: string): number {
+function systemPromptTokens(profile: PukekoProfile, root: string): number | null {
   try {
     const relPath = profile.systemPromptPath ?? DEFAULT_SYSTEM_PROMPT_FILE;
     return textTokens(readFileSync(resolve(root, relPath), 'utf8'));
   } catch {
-    return 0;
+    return null;
   }
 }
 
@@ -226,7 +233,11 @@ export function contextWindowWarning(
   const window = configured ?? OLLAMA_DEFAULT_NUM_CTX;
   const promptFile = profile.systemPromptPath ?? DEFAULT_SYSTEM_PROMPT_FILE;
   const promptTokens = systemPromptTokens(profile, root);
-  const required = budget + promptTokens;
+  // An unreadable prompt costs an unknown amount, not zero — but the comparison
+  // has to use a number, so it uses the only defensible one and the text below
+  // says which of the two cases produced it.
+  const promptCost = promptTokens ?? 0;
+  const required = budget + promptCost;
   if (window >= required) return null;
 
   // Name the condition that actually holds, rather than a paraphrase that
@@ -240,48 +251,72 @@ export function contextWindowWarning(
 
   // Say where the requirement comes from, and say what the number does and does
   // not cover. The prompt is the piece the budget never counted, so it is the
-  // piece the sentence has to name; and when the file cannot be read there is no
-  // figure to quote, which is a different sentence rather than a zero.
+  // piece the sentence has to name — and "counted", "empty" and "unreadable" are
+  // three different facts about that file, each with its own fix, so they get
+  // three sentences rather than one that is true of only one of them.
+  const budgetClause = `context-pruner sizes this profile's history against maxContextTokens=${budget}`;
+  // The floor caveat belongs on every branch, because the term it names is
+  // missing from every branch. Bound tool descriptions cost real window and this
+  // config cannot size them: the tool set belongs to whoever builds the agent.
+  // On the shipped robot preset they measure about 1285 tokens.
+  const floorClause =
+    `${required} does not count the tool descriptions bound alongside the prompt — the tool set ` +
+    `belongs to whoever builds the agent rather than to this config — so treat it as a floor and ` +
+    `not as an exact requirement.`;
   const requirement =
-    promptTokens > 0
-      ? `context-pruner sizes this profile's history against maxContextTokens=${budget}, and the ` +
-        `system prompt adds about ${promptTokens} on top of it, because it is sent outside that ` +
-        `history and has never been part of that budget. Those ${promptTokens} cover ` +
-        `${promptFile} alone, at the pruner's own four-characters-per-token estimate — the ` +
-        `composed prompt also carries tool descriptions this repo does not size, so ${required} ` +
-        `is a floor rather than an exact requirement.`
-      : `context-pruner sizes this profile's history against maxContextTokens=${budget}, and no ` +
-        `prompt file could be read at ${promptFile}, so nothing is counted here for the system ` +
-        `prompt — which is sent outside that history and has never been part of that budget. ` +
-        `${required} is therefore the pruner's budget alone, and whatever prompt and tool ` +
-        `descriptions the server does compose sit above it.`;
+    promptTokens === null
+      ? `${budgetClause}, and no prompt file could be read at ${promptFile}, so nothing is ` +
+        `counted here for the system prompt — which is sent outside that history and has never ` +
+        `been part of that budget. ${required} is therefore the pruner's budget alone. ` +
+        `${floorClause}`
+      : promptTokens === 0
+        ? `${budgetClause}, and ${promptFile} was read and is empty, so the system prompt costs ` +
+          `nothing here — a prompt is sent outside that history and has never been part of that ` +
+          `budget, so any content in that file would cost window on top of it. ${required} is ` +
+          `therefore the pruner's budget alone. ${floorClause}`
+        : `${budgetClause}, and the system prompt adds about ${promptTokens} on top of it, ` +
+          `because it is sent outside that history and has never been part of that budget. Those ` +
+          `${promptTokens} cover ${promptFile} alone, at the pruner's own four-characters-per-` +
+          `token estimate. ${floorClause}`;
 
   // Do NOT quote a difference here as an upper bound on what is lost.
-  // `maxContextTokens` is not enforced anywhere: it sets the summarize threshold
-  // and a log line, and the pruner's own notes record rebuilds landing above it.
-  // A sentence promising "up to N tokens" would be the same false claim this
-  // node is fixing, with a corrected number in it.
+  // `maxContextTokens` is not enforced anywhere: with `summarizeAtFraction` it
+  // sets the point where a summary is attempted, plus a log line, and the
+  // pruner's own notes record rebuilds landing above it. A sentence promising
+  // "up to N tokens" would be the same false claim this node is fixing, with a
+  // corrected number in it — and so would naming `maxContextTokens` AS the
+  // threshold, which is `summarizeAtFraction` times it and never the number in
+  // the same sentence.
   const consequence =
     `Past the window ollama discards from the HEAD — where the opening instruction, the framing ` +
     `and the pruner's own summary sit — with no error, and how much it discards is not bounded ` +
-    `by the gap between these numbers: maxContextTokens sets the summarize threshold rather than ` +
-    `a ceiling the pruner enforces, so a rebuilt history can land above it.`;
+    `by the gap between these numbers: maxContextTokens is not a ceiling the pruner enforces. ` +
+    `Together with summarizeAtFraction it sets the point at which a summary is ATTEMPTED, which ` +
+    `is a fraction of ${budget} and not ${budget} itself, so a rebuilt history can land above ` +
+    `maxContextTokens as well.`;
 
   // Only offer a lower budget when the arithmetic leaves one to offer: with a
   // prompt longer than the whole window, a bigger window is the only fix.
-  const loweredBudget = window - promptTokens;
+  const loweredBudget = window - promptCost;
   const remedy =
     `Raise llm.ollama.numCtx to at least ${required}` +
     (loweredBudget > 0
       ? `, or lower contextPruner.maxContextTokens to ${loweredBudget} or less.`
       : `.`) +
-    // On the no-config path neither of those keys exists to be edited, and
-    // OLLAMA_CONTEXT_LENGTH — the one thing that path can set — appeared only in
-    // the condition clause above. Offer it exactly where it applies: it moves
-    // the default this profile is falling back to.
+    // OLLAMA_CONTEXT_LENGTH is the one lever a run with no config file has, and
+    // it appeared only in the condition clause above, so offer it here too.
+    //
+    // But this branch is gated on an unset `numCtx`, NOT on the absence of a
+    // config file — the two are different conditions and this function is never
+    // told which one holds. The commonest way to reach here is a config file
+    // that simply omits `llm.ollama`, where both keys are perfectly editable, so
+    // asserting that neither exists to edit was false on exactly the path most
+    // people are on. Stated as a conditional, the sentence is true on every
+    // firing without the function needing a fact it does not have.
     (configured === undefined
-      ? ` With no config file, neither key exists to edit and OLLAMA_CONTEXT_LENGTH on the ollama ` +
-        `server is the lever that path has — it sets the default this profile is falling back to.`
+      ? ` Both of those are keys in a config file; where a run has none to edit, ` +
+        `OLLAMA_CONTEXT_LENGTH on the ollama server raises the default this profile is falling ` +
+        `back to.`
       : ``);
 
   return `[config] profile '${profileName}' ${condition}, while it needs a window of at least ${required} tokens: ${requirement} ${consequence} ${remedy}`;

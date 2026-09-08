@@ -3,8 +3,10 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ChatOllama } from '@langchain/ollama'
+import { convertToOpenAITool } from '@langchain/core/utils/function_calling'
 import { contextWindowWarning, loadConfig } from '../server/loadConfig.js'
 import { createLlm } from '../server/createLlm.js'
+import { createRobotTools } from '../src/agent/robotTools.js'
 import type { PukekoProfile } from '../src/lib/config.js'
 import exampleConfig from '../pukeko.config.example.js'
 
@@ -31,6 +33,15 @@ import exampleConfig from '../pukeko.config.example.js'
  * for every override — the same defect one layer down. The custom-path cell
  * below is what makes that distinction testable; a constant passes every other
  * cell in this file.
+ *
+ * **And the budget plus the prompt is still not the whole floor.** Bound tool
+ * descriptions cost window too, and the check cannot size them — the tool set
+ * belongs to whoever builds the agent, not to the config — so it counts two
+ * terms of three and declares itself a lower bound. That is honest, and it is
+ * also how the shipped profiles came to sit ~400 tokens BELOW their real floor
+ * while every cell here was green. The shipped-profile group therefore carries a
+ * separate floor cell that sizes the real tool set through `createRobotTools`,
+ * which is the only assertion in this file that can see that term.
  *
  * Two kinds of assertion here, and they answer different questions:
  *
@@ -141,10 +152,14 @@ describe('RC-62 — contextWindowWarning', () => {
     // wording and red on a correct implementation that rephrased that clause.
     // The defect lived in the remedy, so that is what this pins.
     expect(warning).not.toMatch(/Raise llm\.ollama\.numCtx to at least 30000/)
-    // On this path there is no config file, so the two keys the remedy names
-    // may not exist to edit; the one lever that path has must appear as a
-    // remedy and not only in the condition clause.
-    expect(warning).toContain('OLLAMA_CONTEXT_LENGTH on the ollama server is the lever')
+    // A run with no config file has no key to edit, so the one lever that path
+    // has must appear as a remedy and not only in the condition clause. Stated
+    // as a conditional, because this branch is reached with and without a config
+    // file — see the pair of cells at the end of the loadConfig group.
+    expect(warning).toContain(
+      'Both of those are keys in a config file; where a run has none to edit, ' +
+        'OLLAMA_CONTEXT_LENGTH on the ollama server raises the default'
+    )
   })
 
   it('does not promise an upper bound on what is discarded, because none is enforced', () => {
@@ -154,11 +169,19 @@ describe('RC-62 — contextWindowWarning', () => {
     // notes record rebuilds reaching 30003 and 31060 against it. So "up to N
     // tokens can be discarded" was a false ceiling, and swapping in a corrected
     // N would keep the falsehood and change only the number.
+    //
+    // The same sentence also has to stop calling `maxContextTokens` the
+    // summarize threshold. The threshold is `summarizeAtFraction` TIMES it —
+    // 21000 on the shipped local profiles, not the 30000 the sentence names two
+    // clauses earlier — so the old wording asserted an identity between two
+    // numbers it printed side by side.
     const warning = warn('gemma-default', localProfile())
 
     expect(warning).not.toMatch(/Up to \d+ tokens/)
     expect(warning).toContain('not bounded by the gap between these numbers')
-    expect(warning).toContain('summarize threshold rather than a ceiling')
+    expect(warning).toContain('maxContextTokens is not a ceiling the pruner enforces')
+    expect(warning).toContain('a summary is ATTEMPTED, which is a fraction of 30000 and not 30000')
+    expect(warning).not.toMatch(/maxContextTokens sets the summarize threshold/)
   })
 
   it('reports a numCtx that is set but too small, and does not blame an absent key', () => {
@@ -289,6 +312,26 @@ describe('RC-62 — contextWindowWarning', () => {
         llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: BUDGET } },
       }))
     ).toBeNull()
+  })
+
+  it('calls an EMPTY prompt file empty, not unreadable — they are different facts', () => {
+    // `systemPromptTokens` returned 0 for a throw and for a zero-length read
+    // alike, so a file that exists, is readable and simply has no content in it
+    // was reported as one that "could not be read". Both produce the same
+    // requirement — the budget alone — so the difference is purely textual, and
+    // a reader chasing a permissions or path problem that does not exist is the
+    // whole cost of getting it wrong.
+    writeFileSync(join(promptRoot, 'system-prompt.md'), '')
+
+    const warning = warn('empty-prompt-file', localProfile())
+
+    expect(warning).toContain('system-prompt.md was read and is empty')
+    expect(warning).toContain(`needs a window of at least ${BUDGET} tokens`)
+    // The false statement this cell exists to keep out.
+    expect(warning).not.toContain('could be read')
+    // Still no invented figure: an empty prompt costs nothing, and "adds about
+    // 0" would be a number where a fact belongs.
+    expect(warning).not.toContain('adds about')
   })
 
   it('offers no negative budget when the prompt alone overruns the window', () => {
@@ -443,6 +486,56 @@ describe('RC-62 — the check is installed in loadConfig', () => {
 
     expect(warn).not.toHaveBeenCalled()
   })
+
+  // The unset-numCtx remedy fires on TWO different configurations, and it used
+  // to describe only one of them. The pair below walks both, because a sentence
+  // gated on `configured === undefined` and worded for "no config file" is true
+  // on one firing and false on the other — and the false one is the common case.
+  //
+  // The check is never told which holds: `contextWindowWarning` receives a
+  // profile and a root, never `configPath`. So the fix is a sentence true of
+  // both rather than a fact the function cannot have.
+
+  it('does not claim there is no config file when there IS one that omits llm.ollama', async () => {
+    // Firing one, and the representative path: a real config file on disk with
+    // a real ollama profile in it that simply never sets `llm.ollama`. Both
+    // keys the remedy names are perfectly editable here — the file is right
+    // there — so "neither key exists to edit" was a false statement delivered
+    // end to end through `loadConfig`. Red on the previous wording.
+    writeConfig({
+      llm: { provider: 'ollama', model: 'gemma4:12b' },
+      contextPruner: { maxContextTokens: 30_000 },
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const resolved = await loadConfig(tmpDir)
+    expect(resolved.configPath).not.toBeNull()
+
+    const message = String(warn.mock.calls[0]?.[0])
+    expect(message).toContain('sends no llm.ollama.numCtx')
+    expect(message).not.toContain('With no config file')
+    expect(message).not.toContain('neither key exists to edit')
+    expect(message).toContain(
+      'Both of those are keys in a config file; where a run has none to edit, ' +
+        'OLLAMA_CONTEXT_LENGTH on the ollama server raises the default'
+    )
+  })
+
+  it('still offers OLLAMA_CONTEXT_LENGTH on the path that really has no config file', async () => {
+    // Firing two, and the control for the cell above: an empty directory, so
+    // `loadConfig` falls back to FALLBACK_CONFIG and there genuinely is no file
+    // to edit. The reworded sentence has to keep working here — a fix that made
+    // the first cell pass by deleting the env-var remedy would strand exactly
+    // the reader who has no other lever.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const resolved = await loadConfig(tmpDir)
+    expect(resolved.configPath).toBeNull()
+
+    const message = String(warn.mock.calls[0]?.[0])
+    expect(message).toContain('sends no llm.ollama.numCtx')
+    expect(message).toContain('OLLAMA_CONTEXT_LENGTH on the ollama server raises the default')
+  })
 })
 
 /**
@@ -482,7 +575,7 @@ describe('RC-62 — the shipped local profiles', () => {
     expect(provider).toBe('ollama')
     expect(wireBody(llm)).toEqual({
       model: 'gemma4:12b',
-      options: { num_ctx: 32768 },
+      options: { num_ctx: 49152 },
     })
     expect(local['gemma-default'].contextPruner?.maxContextTokens).toBe(30_000)
   })
@@ -494,7 +587,7 @@ describe('RC-62 — the shipped local profiles', () => {
       model: 'gemma4:12b',
       think: false,
       options: {
-        num_ctx: 32768,
+        num_ctx: 49152,
         temperature: 0.6,
         top_k: 64,
         top_p: 0.95,
@@ -508,6 +601,12 @@ describe('RC-62 — the shipped local profiles', () => {
     // No explicit root: these run at the repo root, against the live
     // `system-prompt.md`, which is the configuration a contributor actually
     // starts the server in. The cell below says what to do when this one fires.
+    //
+    // With ~16000 tokens of slack in the shipped window this survives easily, so
+    // it is a weak discriminator against a check that has started warning on
+    // everything — the hosted-provider and no-pruner cells above are the ones
+    // carrying that weight. It still earns its place as the assertion that the
+    // shipped configuration is quiet, which is what a contributor sees.
     const guidance =
       'the shipped numCtx no longer covers maxContextTokens plus the live system-prompt.md — ' +
       'see the margin assertion in the next cell for the numbers and the remedy'
@@ -523,23 +622,30 @@ describe('RC-62 — the shipped local profiles', () => {
     // apart at the repo root: the shipped profile, the shipped window,
     // redirected at a much larger real file.
     //
-    // `AGENTS.md` stands in for an oversized prompt. Its size is asserted FIRST,
-    // so that if it ever shrinks below the shipped margin this cell fails saying
-    // so, rather than passing while testing nothing.
-    const bigTokens = Math.ceil(readFileSync('AGENTS.md', 'utf8').length / 4)
+    // A large tracked file stands in for an oversized prompt. Its size is
+    // asserted FIRST, so that if it ever shrinks below the shipped margin this
+    // cell fails saying so, rather than passing while testing nothing — and the
+    // bar it has to clear is READ FROM THE SHIPPED WINDOW, because that window
+    // is exactly what makes a given file big enough or not. Widening `numCtx`
+    // once left this guard pinned to the old window, where a file that no longer
+    // overran anything still passed the check that it did.
+    const BIG_PROMPT_FILE = 'tests/contextPrunerMiddleware.test.ts'
+    const shippedNumCtx = local['gemma-default'].llm.ollama?.numCtx ?? 0
+    const bigTokens = Math.ceil(readFileSync(BIG_PROMPT_FILE, 'utf8').length / 4)
     expect(
       bigTokens,
-      'AGENTS.md no longer overruns the shipped window, so this cell would pass without ' +
-        'discriminating a derived headroom from a constant. Point it at a larger tracked file.'
-    ).toBeGreaterThan(32_768 - 30_000)
+      `${BIG_PROMPT_FILE} no longer overruns the shipped window of ${shippedNumCtx}, so this cell ` +
+        'would pass without discriminating a derived headroom from a constant. Point it at a ' +
+        'larger tracked file.'
+    ).toBeGreaterThan(shippedNumCtx - 30_000)
 
     const warning = contextWindowWarning('gemma-default-big-prompt', {
       ...local['gemma-default'],
-      systemPromptPath: 'AGENTS.md',
+      systemPromptPath: BIG_PROMPT_FILE,
     })
 
     expect(warning).toContain(`needs a window of at least ${30_000 + bigTokens} tokens`)
-    expect(warning).toContain('AGENTS.md')
+    expect(warning).toContain(BIG_PROMPT_FILE)
   })
 
   it('the shipped window still covers the live system-prompt.md, and names the slack when it stops', () => {
@@ -552,12 +658,18 @@ describe('RC-62 — the shipped local profiles', () => {
     //
     // The token estimate is written out here rather than imported, so that a
     // change to the pruner's estimator cannot move this expectation with it.
+    //
+    // The shipped window is READ FROM THE CONFIG rather than written down a
+    // second time, so lowering `numCtx` in `pukeko.config.example.ts` reds this
+    // margin directly instead of only tripping an equality that says nothing
+    // about whether the new number is big enough. The by-value pin on 49152
+    // lives in the `wireBody` cells above, where it also proves the camelCase
+    // mapping — one place, not two.
     const promptChars = readFileSync('system-prompt.md', 'utf8').length
     const promptTokens = Math.ceil(promptChars / 4)
     const required = 30_000 + promptTokens
-    const shipped = 32_768
+    const shipped = local['gemma-default'].llm.ollama?.numCtx ?? 0
 
-    expect(local['gemma-default'].llm.ollama?.numCtx).toBe(shipped)
     expect(local['gemma-tuned'].llm.ollama?.numCtx).toBe(shipped)
     expect(local['gemma-default'].contextPruner?.maxContextTokens).toBe(30_000)
 
@@ -568,6 +680,46 @@ describe('RC-62 — the shipped local profiles', () => {
         `longer covers it, and the server would silently truncate from the head. Raise numCtx on ` +
         `both local profiles in pukeko.config.example.ts. Do NOT lower the pruner budget to fit ` +
         `and do NOT relax this assertion — the margin is what makes the shipped profiles correct.`
+    ).toBeGreaterThanOrEqual(0)
+  })
+
+  it('the shipped window also covers the BOUND TOOLS, which the check cannot see', () => {
+    // The cell that would have caught the state this node shipped in. Every
+    // assertion above measures the shipped window against what
+    // `contextWindowWarning` asks for — the pruner's budget plus the system
+    // prompt — and that is deliberately a LOWER bound: the bound tool set
+    // belongs to whoever builds the agent, so the config check cannot size it
+    // and does not try. At 32768 the shipped profiles cleared the check and were
+    // still ~400 tokens under their real floor, and nothing in the repo
+    // disagreed.
+    //
+    // This cell can size it, because `server/index.ts` binds exactly
+    // `createRobotTools(...)` and the test can call the same function. It
+    // asserts the MARGIN, never the tool total: that figure moves on a langchain
+    // bump or a reworded description, and the margin is the property that has to
+    // hold. It is EXPECTED to fire when the preset's tools grow past the slack —
+    // that is the point of it, and the remedy is the window, not this assertion.
+    const promptTokens = Math.ceil(readFileSync('system-prompt.md', 'utf8').length / 4)
+    const toolSpecChars = createRobotTools('192.168.4.1')
+      .map((t) => JSON.stringify(convertToOpenAITool(t)).length)
+      .reduce((a, b) => a + b, 0)
+    const toolTokens = Math.ceil(toolSpecChars / 4)
+    const floor = 30_000 + promptTokens + toolTokens
+    const shipped = local['gemma-default'].llm.ollama?.numCtx ?? 0
+
+    // Guard: if the tools ever serialise to nothing, the margin below would pass
+    // while measuring an empty set.
+    expect(toolTokens, 'no tool specs were measured, so this cell proves nothing').toBeGreaterThan(
+      0
+    )
+
+    expect(
+      shipped - floor,
+      `the shipped local window of ${shipped} no longer covers its real floor of ${floor} = 30000 ` +
+        `budget + ${promptTokens} system prompt + ${toolTokens} bound tool specs. ollama would ` +
+        `truncate from the head, and contextWindowWarning would NOT report it — it counts the ` +
+        `first two terms only and says so. Raise numCtx on both local profiles in ` +
+        `pukeko.config.example.ts and update the accounting in the comment beside it.`
     ).toBeGreaterThanOrEqual(0)
   })
 

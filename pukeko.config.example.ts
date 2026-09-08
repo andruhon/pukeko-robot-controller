@@ -24,7 +24,7 @@ export default defineConfig({
   profiles: {
     'gemma-default': {
       // gemma4:12b rather than 31b, measured on the dev box (Radeon RX 9060 XT,
-      // 15.9 GiB): 12b loads whole into VRAM — 8.4 GB at the 32768-token window
+      // 15.9 GiB): 12b loads whole into VRAM — 9.2 GB at the 49152-token window
       // below, 100% on the GPU, ~4 s to first token. 31b is 21.5 GB loaded, so a
       // third of it runs on the CPU at ANY window, and widening the window makes
       // the spill worse (66% → 60% on GPU) because KV cache displaces weights;
@@ -34,27 +34,43 @@ export default defineConfig({
         provider: 'ollama',
         model: 'gemma4:12b',
         ollama: {
-          // The window the model is actually given (`num_ctx`), and the one key
-          // in this bag that must cover `contextPruner.maxContextTokens` PLUS
-          // the system prompt. The pruner lets history grow to that cap and
-          // budgets only `state.messages`; the system prompt is sent outside
-          // that array and costs window on top of it — roughly 1900 tokens for
-          // the shipped `system-prompt.md`, more if `systemPromptPath` points
-          // somewhere longer. Ollama then serves only its own window and
-          // silently discards the rest FROM THE HEAD — the opening instruction,
-          // the framing and the pruner's own summary go first, with no error.
-          // Left unset, a stock server serves 4096 against the 30000-token
-          // budget below; `loadConfig` warns on any such disagreement, sizing
-          // the prompt from the profile's own file rather than assuming this
-          // one.
+          // The window the model is actually given (`num_ctx`). It has to cover
+          // everything the request carries, and the pruner's budget is only the
+          // first of three terms — all three measured against this repo:
           //
-          // So the minimum here is not 30000 — it is 30000 plus the prompt, and
-          // the ~2800 tokens between that budget and 32768 are what pays for it.
-          // THAT MARGIN IS LOAD-BEARING: do not tidy this number down to the
-          // budget. 32768 costs nothing to prefer — ollama's granted window is a
-          // power of two anyway, and on 12b, 4096 → 32768 cost 0.3 GB and stayed
-          // 100% on the GPU.
-          numCtx: 32768,
+          //   30000  contextPruner.maxContextTokens below: the history the
+          //          pruner lets accumulate, and the only term it counts.
+          //    1887  system-prompt.md, handed to createAgent as `systemPrompt`
+          //          and applied OUTSIDE state.messages, so it was never in that
+          //          budget. Larger if `systemPromptPath` points somewhere else.
+          //    1285  the tool specs bound for the shipped robot preset: 5139
+          //          characters of name, description and JSON schema across its
+          //          8 tools, read off `createRobotTools` through langchain's
+          //          `convertToOpenAITool`. Also outside the budget, and nothing
+          //          in this repo sizes it.
+          //   -----
+          //   33172  the floor — and 32768 shipped here, BELOW it.
+          //
+          // `loadConfig` warns when the window fails to cover the first two
+          // terms. It cannot cover the third: the bound tool set belongs to
+          // whoever builds the agent, not to this file. So the check's silence
+          // is a LOWER bound, and a window that only just clears what it asks
+          // for can still truncate — which is why the number here is chosen
+          // against the floor above and not against the warning.
+          //
+          // Past its window ollama serves what fits and discards the rest FROM
+          // THE HEAD — the opening instruction, the framing and the pruner's own
+          // summary go first, with no error. Left unset, a stock server serves
+          // 4096 against the 30000-token budget below.
+          //
+          // 49152 sits about 16000 tokens above the floor, and that slack is
+          // deliberate rather than round-number padding: the browser declares
+          // its own client tools over AG-UI on top of the 1285 above, and nobody
+          // has sized those. Measured on the dev GPU named above — ollama
+          // granted 49152 in full and reported the model at 9.2 GB, all of it in
+          // VRAM, 100% on the GPU. That is this card. On a smaller one the model
+          // will spill to the CPU, and this is the first number to bring down.
+          numCtx: 49152,
         },
       },
       middleware: ['frontend-images', 'context-pruner', 'observability', 'lazy-tool-recovery'],
@@ -88,7 +104,7 @@ export default defineConfig({
         ollama: {
           // Held identical to 'gemma-default' — see the note above the profile,
           // and the reasoning beside that profile's own numCtx.
-          numCtx: 32768,
+          numCtx: 49152,
           // A switch, not a budget — this suppresses thinking rather than shortening it.
           think: false,
           temperature: 0.6, // the model's own default is 1
