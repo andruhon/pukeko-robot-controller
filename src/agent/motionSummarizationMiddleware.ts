@@ -49,7 +49,41 @@ interface MaybeBlock {
   text?: string;
 }
 
-function stripImageBlocks(msg: BaseMessage): BaseMessage {
+// Drop `image` / `image_url` blocks from a message's content array. Used only on
+// the transient input handed to the summarizer: the summary is text, and a frame
+// would spend the small local model's whole budget describing what it must not
+// describe.
+//
+// The message is COPIED, never re-described — a prototype-preserving clone of its
+// own property descriptors with only `content` replaced, the same shape as the
+// three strips in contextPrunerMiddleware. The literal rebuild this replaces
+// named at most three fields per type, so `id`, `status`, `artifact`,
+// `response_metadata` and `additional_kwargs` were dropped from every message it
+// touched, and a streamed AIMessageChunk was flattened into a plain AIMessage.
+//
+// Its severity is lower than the strips in contextPrunerMiddleware, and the
+// reason is recorded so nobody inflates it: this output feeds the summarizer's
+// own LLM call and nothing else. It is never checkpointed and never becomes
+// conversation state, so a dropped field does not persist past that call. What
+// makes it worth fixing anyway is that the loss is silent and open-ended — every
+// field added upstream later goes the same way with nothing to say so.
+//
+// `lc_kwargs` is replaced alongside `content`, as in every strip here: a
+// descriptor clone shares that bag with the source BY REFERENCE and it still
+// holds the original content, so the frames this function exists to drop would
+// stay reachable through the copy, and any serializer resolving values from
+// `lc_kwargs` rather than the live field would put them straight back into
+// whatever it wrote — a trace, a log, the summarizer payload itself.
+//
+// The four-type gate is deliberate rather than an artifact of the rebuild: a
+// message of any other type passes through untouched today, and widening that
+// here would be a behaviour change this function was not asked to make. The
+// checks are duck-typed and must stay so — this repo can resolve more than one
+// `@langchain/core`, and a message built by the other copy answers `_getType()`
+// correctly while failing every class check (RC-21, RC-58).
+//
+// Returns the same instance when nothing changed. The source is never mutated.
+export function stripImageBlocks(msg: BaseMessage): BaseMessage {
   if (typeof msg.content === 'string') return msg;
   if (!Array.isArray(msg.content)) return msg;
   const original = msg.content as MaybeBlock[];
@@ -57,24 +91,25 @@ function stripImageBlocks(msg: BaseMessage): BaseMessage {
     (b) => b && b.type !== 'image' && b.type !== 'image_url'
   );
   if (textOnly.length === original.length) return msg;
-  const newContent = (textOnly.length === 0 ? '[image omitted]' : textOnly) as unknown as BaseMessage['content'];
-  if (isAIMessage(msg)) {
-    return new AIMessage({ content: newContent, tool_calls: (msg as AIMessage).tool_calls, name: msg.name });
-  }
-  if (isHumanMessage(msg)) {
-    return new HumanMessage({ content: newContent, name: msg.name });
-  }
-  if (isToolMessage(msg)) {
-    return new ToolMessage({
-      content: typeof newContent === 'string' ? newContent : JSON.stringify(newContent),
-      tool_call_id: (msg as ToolMessage).tool_call_id,
-      name: msg.name,
-    });
-  }
-  if (isSystemMessage(msg)) {
-    return new SystemMessage({ content: newContent, name: msg.name });
-  }
-  return msg;
+  const handled =
+    isAIMessage(msg) || isHumanMessage(msg) || isToolMessage(msg) || isSystemMessage(msg);
+  if (!handled) return msg;
+
+  const stripped = textOnly.length === 0 ? '[image omitted]' : textOnly;
+  // A ToolMessage carries the survivors as a JSON string, exactly as the rebuild
+  // did. The transformation this function performs is unchanged; only the way
+  // the result is carried onto the message is.
+  const newContent = (
+    isToolMessage(msg) && typeof stripped !== 'string' ? JSON.stringify(stripped) : stripped
+  ) as unknown as BaseMessage['content'];
+
+  const copy = Object.create(
+    Object.getPrototypeOf(msg) as object,
+    Object.getOwnPropertyDescriptors(msg)
+  ) as BaseMessage;
+  copy.content = newContent;
+  copy.lc_kwargs = { ...msg.lc_kwargs, content: newContent };
+  return copy;
 }
 
 function extractText(content: BaseMessage['content']): string {

@@ -878,19 +878,26 @@ describe('contextPrunerMiddleware — RC-28 reasoning strip preserves the whole 
     expect(readUnknownField(out)).toBe('survives')
   })
 
-  it('the strip holds through the checkpoint serde — the stripped reasoning is absent from the serialized bytes and the un-named field is present', async () => {
-    // Every assertion above reads a property off the returned object. The bytes
-    // langgraph checkpoints are produced by a different route: the message's
-    // toJSON takes its KEY SET from lc_kwargs and its VALUES from the live
-    // instance fields. The strip copies the source's own property descriptors,
-    // so the clone shares lc_kwargs with the source BY REFERENCE and that shared
-    // object still carries the reasoning. Today the instance field wins and the
-    // payload is clean — but that is a property of one library version, not of
-    // this module, and nothing else in this suite would notice it changing.
-    // Assert on the bytes, so a core that resolved lc_kwargs first (or anyone
-    // patching lc_kwargs) is caught here rather than in a checkpoint in
-    // production, where the reasoning would be persisted while every
-    // property-reading test above still passed.
+  it('the dropped reasoning is unreachable by every route — instance field, lc_kwargs and the checkpoint bytes — while the un-named field rides into them', async () => {
+    // Every property assertion above reads one field off the returned object,
+    // and two other routes reach the same message. The bytes langgraph
+    // checkpoints come from `toJSON`, which takes its KEY SET from `lc_kwargs`
+    // and its VALUES from the live instance fields; `lc_kwargs` itself is
+    // readable by anything holding the message.
+    //
+    // A copy taken from the source's own property descriptors shares `lc_kwargs`
+    // with the source BY REFERENCE, so a bare clone leaves the reasoning sitting
+    // in that shared bag — retained in memory for the life of the thread, since
+    // this middleware's output BECOMES the conversation state, and one
+    // extended-thinking block per assistant turn is not small. It would also
+    // leave these bytes clean only for as long as `toJSON` prefers the instance
+    // field, which is a property of one library version rather than of this
+    // module.
+    //
+    // The strip therefore replaces `lc_kwargs` too, exactly as the two image
+    // strips do, and this test pins all three routes rather than the bytes
+    // alone — so the retention is caught here rather than in a heap dump, and
+    // the byte guarantee stops depending on a precedence rule nothing pins.
     const llm = makeStubLlm()
     const mw = createContextPrunerMiddleware({ llm }) as HookContainer
     const before = getHook(mw.beforeModel)
@@ -918,6 +925,22 @@ describe('contextPrunerMiddleware — RC-28 reasoning strip preserves the whole 
       runtime
     )
     const updated = (result as { messages: BaseMessage[] }).messages
+
+    // Route two: the clone's own `lc_kwargs`. This is the assertion that reds if
+    // the replacement line is dropped and the bag is shared with the source
+    // again — the byte assertions below would not, because the instance field
+    // wins in `toJSON` today.
+    const outOld = updated[2] as AIMessage
+    const outChunk = updated[3] as AIMessageChunk
+    expect(JSON.stringify(outOld.lc_kwargs)).not.toContain('OLD reasoning')
+    expect(JSON.stringify(outChunk.lc_kwargs)).not.toContain('CHUNK reasoning')
+    // The clone's bag still carries what the strip did not name, so the two
+    // assertions above cannot pass on an emptied or absent `lc_kwargs`.
+    expect(JSON.stringify(outOld.lc_kwargs)).toContain('rs_abc123')
+    // The source is untouched: its bag is a different object and still holds the
+    // reasoning the caller handed in.
+    expect(JSON.stringify(aiOld.lc_kwargs)).toContain('OLD reasoning')
+    expect(outOld.lc_kwargs).not.toBe(aiOld.lc_kwargs)
 
     // `serde` is a public, typed member of BaseCheckpointSaver
     // (`dumpsTyped(data: any): Promise<[string, Uint8Array]>`), so this is the
@@ -1116,8 +1139,8 @@ describe('contextPrunerMiddleware — RC-29 ToolMessage image-data strip preserv
   it('the dropped frame is unreachable by every route — instance content, lc_kwargs and the checkpoint bytes — while status rides into them', async () => {
     // Copying a message from its own property descriptors shares `lc_kwargs`
     // with the source BY REFERENCE, and that bag still holds the original
-    // content string. Here — unlike in the reasoning strip — the field being
-    // rewritten IS the payload this function exists to free, so a bare
+    // content string. The field being rewritten IS the payload this function
+    // exists to free — the test all three strips here are held to — so a bare
     // descriptor copy would turn a byte-dropping function into a byte-retaining
     // one: the frame would stay reachable for the life of the thread (one per
     // motion), and any serializer resolving values from `lc_kwargs` rather than

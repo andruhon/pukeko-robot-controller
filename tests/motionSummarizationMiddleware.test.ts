@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
   AIMessage,
+  AIMessageChunk,
   HumanMessage,
   SystemMessage,
   ToolMessage,
@@ -8,6 +9,7 @@ import {
 } from '@langchain/core/messages'
 import {
   createMotionSummarizationMiddleware,
+  stripImageBlocks,
   stripUnpairedToolCalls,
   buildSummarizationMessages,
   __pendingSummariesForTest,
@@ -20,7 +22,11 @@ import {
   isSystemMessage,
   isToolMessage,
 } from '@langchain/core/messages'
-import { foreignHumanMessage, isForeignToThisCore } from './helpers/foreignCoreMessage.js'
+import {
+  foreignCoreMessage,
+  foreignHumanMessage,
+  isForeignToThisCore,
+} from './helpers/foreignCoreMessage.js'
 
 // Collect every tool_use id an AIMessage carries, from BOTH representations:
 // the generic `.tool_calls` array AND Anthropic-native `tool_use` content
@@ -673,5 +679,330 @@ describe('motionSummarizationMiddleware — RC-58 a foreign-copy first HumanMess
     expect(summaryMsg).toBeDefined()
     expect(String((summaryMsg as BaseMessage).content)).toContain(SUMMARY_TEXT)
     expect(rebuilt.filter((m) => isSystemMessage(m))).toEqual([])
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────────────
+// RC-30 — stripImageBlocks copies the message instead of re-describing it
+//
+// Same defect class as RC-28 and RC-29 in contextPrunerMiddleware, and the
+// fourth instance of it. The strip used to rebuild each of the four message
+// types from an object literal naming at most three fields, so `id`, `status`,
+// `artifact`, `response_metadata` and `additional_kwargs` were dropped from
+// every message it touched, and a streamed AIMessageChunk was flattened into a
+// plain AIMessage.
+//
+// The severity is genuinely lower than its siblings', and saying so is part of
+// the record: this output feeds the summarizer's own LLM call and nothing else,
+// so a dropped field never reaches conversation state or a checkpoint. The trap
+// is that the loss is silent and open-ended — every field added upstream later
+// goes the same way.
+//
+// There is ONE CLASS GUARD PER MESSAGE TYPE, each asserting on a property the
+// production code does not name anywhere, so each stays red under any
+// field-enumerating rebuild of that type however long the enumeration. Four
+// guards rather than one parameterised sweep, so putting the literal back for a
+// single type reds exactly one of them.
+//
+// Every preservation assertion sits beside an assertion that the strip actually
+// fired: a function that simply returned its argument would satisfy the
+// preservation half on its own.
+//
+// The guards call `stripImageBlocks` directly rather than reaching it through
+// `buildSummarizationMessages`, and that is load-bearing. The pipeline runs
+// `stripUnpairedToolCalls` immediately after, and THAT function still rebuilds
+// an AIMessage from a literal when it strips a call — which on the real trigger
+// path is the common case, since afterModel fires on the just-emitted motion
+// call whose ToolMessage does not exist yet. Routing these guards through the
+// pipeline would test two functions and report the result as one.
+// ───────────────────────────────────────────────────────────────────────────
+describe('motionSummarizationMiddleware — RC-30 the image strip preserves the whole message', () => {
+  const FRAME_BYTES = 'SUMMARIZERFRAMEMARKER'
+
+  // Read/write a property the production code has never heard of. Cast because
+  // no message type declares it — that is exactly the point.
+  function stampUnnamedField(msg: BaseMessage, value: unknown): void {
+    ;(msg as unknown as Record<string, unknown>).field_no_one_enumerated = value
+  }
+  function readUnnamedField(msg: BaseMessage): unknown {
+    return (msg as unknown as Record<string, unknown>).field_no_one_enumerated
+  }
+
+  function markedImageBlock() {
+    return {
+      type: 'image' as const,
+      source_type: 'base64' as const,
+      mime_type: 'image/jpeg',
+      data: `${FRAME_BYTES}${'X'.repeat(64)}`,
+    }
+  }
+  function hasImage(content: unknown): boolean {
+    return (
+      Array.isArray(content) &&
+      (content as Array<{ type?: string }>).some(
+        (b) => b.type === 'image' || b.type === 'image_url'
+      )
+    )
+  }
+
+  it('CLASS GUARD (AIMessage): a field the strip does not name survives, and a chunk stays a chunk', () => {
+    const ai = new AIMessage({
+      id: 'ai-1',
+      name: 'pilot',
+      content: [{ type: 'text', text: 'Looking at the frame.' }, markedImageBlock()],
+      tool_calls: [{ name: 'turn_right', args: { steps: 1 }, id: 'tc-1' }],
+      additional_kwargs: { reasoning_content: 'thought about it' },
+      response_metadata: { model_name: 'gpt-5.2', output: [{ type: 'reasoning', id: 'rs_abc123' }] },
+    })
+    stampUnnamedField(ai, { anything: 'at all' })
+
+    const out = stripImageBlocks(ai) as AIMessage
+
+    // The strip fired…
+    expect(hasImage(out.content)).toBe(false)
+    expect(out.content).toEqual([{ type: 'text', text: 'Looking at the frame.' }])
+    // …and it carried across a field nothing in the implementation mentions.
+    expect(readUnnamedField(out)).toEqual({ anything: 'at all' })
+    // …along with every field the old literal rebuild forgot.
+    expect(out.id).toBe('ai-1')
+    expect(out.response_metadata).toEqual({
+      model_name: 'gpt-5.2',
+      output: [{ type: 'reasoning', id: 'rs_abc123' }],
+    })
+    expect(out.additional_kwargs).toEqual({ reasoning_content: 'thought about it' })
+    // The fields the literal did remember are still correct too.
+    expect(out.name).toBe('pilot')
+    expect(out.tool_calls?.map((tc) => tc.id)).toEqual(['tc-1'])
+    // The caller still holds the input array; the source must be untouched.
+    expect(hasImage(ai.content)).toBe(true)
+    expect(out).not.toBe(ai)
+
+    // A streamed turn arrives as an AIMessageChunk, which isAIMessage admits and
+    // a literal rebuild would flatten into a plain AIMessage. Compared by
+    // prototype, never instanceof: this repo can resolve two copies of
+    // @langchain/core, so a class check is unreliable here (RC-21/RC-58).
+    const chunk = new AIMessageChunk({
+      id: 'ai-chunk',
+      content: [{ type: 'text', text: 'partial' }, markedImageBlock()],
+      tool_call_chunks: [
+        { name: 'turn_left', args: '{"steps":1}', id: 'tc-2', index: 0, type: 'tool_call_chunk' },
+      ],
+    })
+    const outChunk = stripImageBlocks(chunk) as AIMessageChunk
+    expect(hasImage(outChunk.content)).toBe(false)
+    expect(Object.getPrototypeOf(outChunk)).toBe(Object.getPrototypeOf(chunk))
+    expect(outChunk.tool_call_chunks).toEqual([
+      { name: 'turn_left', args: '{"steps":1}', id: 'tc-2', index: 0, type: 'tool_call_chunk' },
+    ])
+  })
+
+  it('CLASS GUARD (HumanMessage): a field the strip does not name survives the injected camera turn', () => {
+    const human = new HumanMessage({
+      id: 'h-1',
+      name: 'operator',
+      content: [{ type: 'text', text: 'Camera frame captured:' }, markedImageBlock()],
+      additional_kwargs: { capture_ts: 1717, source: 'front_cam' },
+      response_metadata: { bridge: 'robot-bridge/2' },
+    })
+    stampUnnamedField(human, { anything: 'at all' })
+
+    const out = stripImageBlocks(human) as HumanMessage
+
+    expect(hasImage(out.content)).toBe(false)
+    expect(out.content).toEqual([{ type: 'text', text: 'Camera frame captured:' }])
+    expect(readUnnamedField(out)).toEqual({ anything: 'at all' })
+    expect(out.id).toBe('h-1')
+    expect(out.additional_kwargs).toEqual({ capture_ts: 1717, source: 'front_cam' })
+    expect(out.response_metadata).toEqual({ bridge: 'robot-bridge/2' })
+    expect(out.name).toBe('operator')
+    expect(Object.getPrototypeOf(out)).toBe(Object.getPrototypeOf(human))
+    expect(hasImage(human.content)).toBe(true)
+    expect(out).not.toBe(human)
+  })
+
+  it('CLASS GUARD (ToolMessage): a field the strip does not name survives, and a FAILED motion stays distinguishable', () => {
+    const tool = new ToolMessage({
+      id: 'tm-1',
+      content: [{ type: 'text', text: 'turn_right (steps=1)' }, markedImageBlock()],
+      tool_call_id: 'tc-1',
+      name: 'turn_right',
+      status: 'error',
+      artifact: { frameId: 'FRAMEARTIFACTMARKER', width: 640 },
+      response_metadata: { bridge: 'robot-bridge/2', attempt: 2 },
+      additional_kwargs: { servo_fault: 'left_hip stalled' },
+    })
+    stampUnnamedField(tool, { anything: 'at all' })
+
+    const out = stripImageBlocks(tool) as ToolMessage
+
+    // The strip fired, and a ToolMessage still carries its survivors as a JSON
+    // string — the transformation is unchanged, only the way it is carried.
+    expect(out.content).toBe(JSON.stringify([{ type: 'text', text: 'turn_right (steps=1)' }]))
+    expect(readUnnamedField(out)).toEqual({ anything: 'at all' })
+    // `status` first: a motion that FAILED must not come back indistinguishable
+    // from one that completed.
+    expect(out.status).toBe('error')
+    expect(out.artifact).toEqual({ frameId: 'FRAMEARTIFACTMARKER', width: 640 })
+    expect(out.response_metadata).toEqual({ bridge: 'robot-bridge/2', attempt: 2 })
+    expect(out.additional_kwargs).toEqual({ servo_fault: 'left_hip stalled' })
+    expect(out.id).toBe('tm-1')
+    expect(out.tool_call_id).toBe('tc-1')
+    expect(out.name).toBe('turn_right')
+    expect(Object.getPrototypeOf(out)).toBe(Object.getPrototypeOf(tool))
+    expect(hasImage(tool.content)).toBe(true)
+    expect(out).not.toBe(tool)
+  })
+
+  it('CLASS GUARD (SystemMessage): a field the strip does not name survives', () => {
+    const system = new SystemMessage({
+      id: 's-1',
+      name: 'harness',
+      content: [{ type: 'text', text: 'You control a biped robot.' }, markedImageBlock()],
+      additional_kwargs: { profile: 'local-ollama' },
+      response_metadata: { composed_by: 'lean-backend' },
+    })
+    stampUnnamedField(system, { anything: 'at all' })
+
+    const out = stripImageBlocks(system) as SystemMessage
+
+    expect(hasImage(out.content)).toBe(false)
+    expect(out.content).toEqual([{ type: 'text', text: 'You control a biped robot.' }])
+    expect(readUnnamedField(out)).toEqual({ anything: 'at all' })
+    expect(out.id).toBe('s-1')
+    expect(out.additional_kwargs).toEqual({ profile: 'local-ollama' })
+    expect(out.response_metadata).toEqual({ composed_by: 'lean-backend' })
+    expect(out.name).toBe('harness')
+    expect(Object.getPrototypeOf(out)).toBe(Object.getPrototypeOf(system))
+    expect(hasImage(system.content)).toBe(true)
+    expect(out).not.toBe(system)
+  })
+
+  it('keeps the caption-less fallback and still preserves the rest of the message', () => {
+    // Nothing survives the filter, so the '[image omitted]' placeholder stands in
+    // for the slot. That branch builds its own content, which is exactly where a
+    // rebuild is most tempting.
+    const human = new HumanMessage({
+      id: 'h-bare',
+      content: [markedImageBlock()],
+      additional_kwargs: { source: 'front_cam' },
+    })
+    stampUnnamedField(human, 'survives the fallback branch too')
+
+    const out = stripImageBlocks(human) as HumanMessage
+
+    expect(out.content).toBe('[image omitted]')
+    expect(readUnnamedField(out)).toBe('survives the fallback branch too')
+    expect(out.additional_kwargs).toEqual({ source: 'front_cam' })
+    expect(out.id).toBe('h-bare')
+  })
+
+  it('the dropped frame is unreachable through the copy — content AND the shared lc_kwargs bag', () => {
+    // A copy taken from the source's own property descriptors shares `lc_kwargs`
+    // with the source BY REFERENCE, and that bag still holds the original
+    // content — the frame this function exists to drop. The strip replaces it,
+    // and this is the assertion that reds if that line goes: every property
+    // assertion above reads the live field and would stay green.
+    const human = new HumanMessage({
+      id: 'h-1',
+      content: [{ type: 'text', text: 'Camera frame captured:' }, markedImageBlock()],
+      response_metadata: { bridge: 'HUMANMETAMARKER' },
+    })
+
+    const out = stripImageBlocks(human)
+
+    expect(JSON.stringify(out.content)).not.toContain(FRAME_BYTES)
+    expect(JSON.stringify(out.lc_kwargs)).not.toContain(FRAME_BYTES)
+    // The bag still carries what the strip did not name, so the assertion above
+    // cannot be passing on an emptied or absent `lc_kwargs`.
+    expect(JSON.stringify(out.lc_kwargs)).toContain('HUMANMETAMARKER')
+    // The source is untouched: a different bag, still holding the frame.
+    expect(JSON.stringify(human.lc_kwargs)).toContain(FRAME_BYTES)
+    expect(out.lc_kwargs).not.toBe(human.lc_kwargs)
+  })
+
+  it('returns the same object reference when there is nothing to strip', () => {
+    const plainString = new HumanMessage({ id: 'h-str', content: 'no blocks at all' })
+    const noImages = new AIMessage({
+      id: 'ai-txt',
+      content: [{ type: 'text', text: 'text only' }],
+    })
+    // Not one of the four types the strip transforms. It passes through
+    // untouched, images and all — deliberate, and unchanged by RC-30.
+    const other = foreignCoreMessage('remove', {
+      id: 'rm-1',
+      content: [{ type: 'text', text: 'gone' }, markedImageBlock()],
+    })
+
+    expect(stripImageBlocks(plainString)).toBe(plainString)
+    expect(stripImageBlocks(noImages)).toBe(noImages)
+    expect(stripImageBlocks(other)).toBe(other)
+  })
+
+  it('a message from the OTHER core copy is stripped, and comes back still foreign', () => {
+    // The duck-typed gate is what admits it at all: reverting any of the four
+    // checks to `instanceof` would return this message unstripped, and its frame
+    // would ride into the summarizer's payload. Copying rather than rebuilding is
+    // what keeps it foreign — a literal rebuild would re-mint it under THIS
+    // copy's class, quietly changing what the rest of the pipeline holds.
+    const foreign = foreignHumanMessage({
+      id: 'h-foreign',
+      content: [{ type: 'text', text: 'Camera frame captured:' }, markedImageBlock()],
+      response_metadata: { bridge: 'robot-bridge/2' },
+    })
+    expect(isForeignToThisCore(foreign)).toBe(true)
+
+    const out = stripImageBlocks(foreign)
+
+    expect(hasImage(out.content)).toBe(false)
+    expect(out.content).toEqual([{ type: 'text', text: 'Camera frame captured:' }])
+    expect(isForeignToThisCore(out)).toBe(true)
+    expect(out.id).toBe('h-foreign')
+    expect(out.response_metadata).toEqual({ bridge: 'robot-bridge/2' })
+  })
+
+  it('the preservation holds through buildSummarizationMessages on a fully paired history', () => {
+    // The wiring check. The history is paired ON PURPOSE: `stripUnpairedToolCalls`
+    // runs straight after the strip and rebuilds an AIMessage from a literal
+    // whenever it drops a call, so an unpaired fixture would lose fields here for
+    // a reason outside this function. That rebuild is a separate defect of the
+    // same class, still live at the `new AIMessage({` in that function.
+    const user = new HumanMessage({ id: 'u-1', content: 'Find the red cone.' })
+    const imageHuman = new HumanMessage({
+      id: 'h-1',
+      content: [{ type: 'text', text: 'Camera frame captured:' }, markedImageBlock()],
+      response_metadata: { bridge: 'robot-bridge/2' },
+    })
+    stampUnnamedField(imageHuman, { anything: 'at all' })
+    const motionAi = new AIMessage({
+      id: 'ai-1',
+      content: '',
+      tool_calls: [{ name: 'turn_right', args: { steps: 1 }, id: 'tc-1' }],
+    })
+    const motionTool = new ToolMessage({
+      id: 'tm-1',
+      content: JSON.stringify({ motion: 'turn_right (steps=1)' }),
+      tool_call_id: 'tc-1',
+      name: 'turn_right',
+      status: 'error',
+    })
+
+    const built = buildSummarizationMessages(
+      [user, imageHuman, motionAi, motionTool],
+      'SUMMARY PROMPT'
+    )
+
+    // No image block reaches the summarizer…
+    for (const m of built) {
+      expect(hasImage(m.content)).toBe(false)
+    }
+    // …and the camera turn arrives with everything it came with.
+    const out = built.find((m) => m.id === 'h-1') as HumanMessage
+    expect(out).toBeDefined()
+    expect(readUnnamedField(out)).toEqual({ anything: 'at all' })
+    expect(out.response_metadata).toEqual({ bridge: 'robot-bridge/2' })
+    // The paired motion pair survived intact, so the fixture really did take the
+    // pass-through branch of stripUnpairedToolCalls.
+    expect(built.find((m) => m.id === 'ai-1')).toBe(motionAi)
+    expect(built.find((m) => m.id === 'tm-1')).toBe(motionTool)
   })
 })

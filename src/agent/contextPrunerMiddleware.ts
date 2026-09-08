@@ -97,8 +97,8 @@ interface MaybeBlock {
 // failed motion became indistinguishable from a completed one. `artifact`,
 // `response_metadata` and `additional_kwargs` went the same way.
 //
-// `lc_kwargs` is replaced too, unlike in stripReasoningContent, because here the
-// field being rewritten IS the payload this function exists to free. A plain
+// `lc_kwargs` is replaced too — as in all three strips in this file — because the
+// field being rewritten IS the payload the function exists to free. A plain
 // descriptor copy shares the source's `lc_kwargs` by reference, and that object
 // still holds the original content string — so the base64 frame this call just
 // dropped would stay reachable for the life of the thread (one per motion), and
@@ -185,9 +185,24 @@ function pruneImageBlocksInHumanMessage(msg: HumanMessage): HumanMessage {
 // keeps the message on the prototype it arrived with, rather than re-minting it
 // under this module's copy of @langchain/core — this repo resolves two.
 //
+// `lc_kwargs` is replaced alongside `additional_kwargs`, on the same terms as the
+// two image strips above and for the same reason: a descriptor clone shares that
+// bag with the source BY REFERENCE, and it still holds the reasoning this call
+// just dropped. The test that puts the image strips' replacement there applies
+// here unchanged — the field being rewritten IS the payload this function exists
+// to free — and extended-thinking blocks are not small, so a bare clone retains
+// one per assistant turn for the life of the thread. This middleware's output
+// BECOMES the conversation state, so those clones are long-lived rather than
+// transient.
+//
+// The serialized form is identical either way while `toJSON` resolves a key that
+// is present on the instance from the instance, and `additional_kwargs` always
+// is; replacing `lc_kwargs` is what makes that precedence stop mattering, rather
+// than leaving the checkpoint's cleanliness resting on a rule nothing here pins.
+//
 // Returns the same instance when nothing changed: the caller counts strips by
 // reference identity. The source is never mutated — only the clone's
-// `additional_kwargs` is replaced, and with a fresh object.
+// `additional_kwargs` and `lc_kwargs` are replaced, and both with fresh objects.
 function stripReasoningContent(msg: AIMessage): AIMessage {
   const ak = msg.additional_kwargs as Record<string, unknown> | undefined;
   if (!ak || ak.reasoning_content == null) return msg;
@@ -198,6 +213,7 @@ function stripReasoningContent(msg: AIMessage): AIMessage {
     Object.getOwnPropertyDescriptors(msg)
   ) as AIMessage;
   copy.additional_kwargs = rest;
+  copy.lc_kwargs = { ...msg.lc_kwargs, additional_kwargs: rest };
   return copy;
 }
 
