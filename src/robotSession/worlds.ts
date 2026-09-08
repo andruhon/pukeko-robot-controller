@@ -15,6 +15,7 @@ import {
   createHttpSnapshotCaptureSource,
   frameToEnvelope,
   type ImageCaptureSource,
+  type WebcamStatus,
 } from '@galvanized-pukeko/vue-ui';
 import { RobotSession, type RobotSessionOptions } from './RobotSession.js';
 import type { BrowserCapabilities, CallScopedCapabilities } from './interpreter.js';
@@ -73,9 +74,13 @@ export const CAPTURE_PATH = '/capture';
  * camera start observed here. Exhausting it is therefore a REAL failure (the
  * camera is denied, absent, or held by another application), not a warm-up, and
  * that is what the motion path's expiry message says: the stream produced no
- * usable frame within the deadline. `capture_image`'s expiry still asks whether
- * the camera is active, because that string is frozen inside vue-ui's envelope
- * contract and is not this repo's to change.
+ * usable frame within the deadline.
+ *
+ * RC-55: a camera that reports one of those causes no longer reaches this
+ * deadline at all — see CAMERA_STATUSES_THAT_CANNOT_IMPROVE below. What still
+ * spends the full budget is a camera that is genuinely starting, and a live
+ * stream whose frames never decode; those are the two cases where waiting is
+ * the right thing to do.
  *
  * Deliberately not exported: the two injection points on WorldCapabilitiesDeps
  * are how a caller varies these, and an export with no reader is surface that
@@ -88,6 +93,34 @@ const CAMERA_READY_TIMEOUT_MS = 5_000;
  * frame beyond the camera actually being ready.
  */
 const CAMERA_READY_POLL_MS = 25;
+
+/**
+ * RC-55. The camera statuses that will never become `live` by waiting, so a call
+ * that sees one answers immediately instead of polling
+ * {@link CAMERA_READY_TIMEOUT_MS} out. A denied camera used to cost five seconds
+ * per tool call to say nothing useful.
+ *
+ * WHY EXACTLY THESE THREE, and why this set must not be "simplified" into
+ * "every status that isn't `live`":
+ *
+ * - `starting` is the one status where waiting is the entire point. It is the
+ *   window RC-53 exists to close.
+ * - `idle` is the state BETWEEN the panel mounting and its `getUserMedia` call
+ *   being dispatched. Failing fast there reinstates precisely the race RC-53
+ *   measured and closed — the stream went live at 133 ms while a capture issued
+ *   at 110 ms lost by 23 ms. A capture arriving in that gap must wait, not fail.
+ * - `error` is a rejection this vocabulary does not name, so vue-ui maps it to
+ *   the frozen message. Failing fast on it would buy a quicker way of saying
+ *   nothing, and the node does not ask for it.
+ *
+ * `denied`, `no-device` and `busy` are the three that both name a cause a
+ * caller can act on AND cannot resolve themselves while the call is in flight.
+ */
+const CAMERA_STATUSES_THAT_CANNOT_IMPROVE: readonly WebcamStatus[] = [
+  'denied',
+  'no-device',
+  'busy',
+];
 
 /** The hosts the two worlds live on, resolved from env by the caller. */
 export interface WorldHosts {
@@ -136,6 +169,19 @@ export interface WebcamPanelLike {
    * makes the type-checker enumerate the construction sites instead.
    */
   isActive: boolean;
+  /**
+   * RC-55: why the camera does or does not have frames. Present on any
+   * `PkWebcamPanel` new enough to expose it (vue-ui >= 0.2.4), where it arrives
+   * already unwrapped from its `ref` — the same way `isActive` does.
+   *
+   * Optional, unlike `isActive`, and for the opposite reason. An absent
+   * `isActive` has no honest default, so requiring it makes the type-checker
+   * enumerate the construction sites. An absent `cameraStatus` DOES have one:
+   * "this surface cannot say why", which is exactly the pre-RC-55 behaviour and
+   * is what every failure path already falls back to. Requiring it would force a
+   * fabricated status on every stand-in that genuinely has none.
+   */
+  cameraStatus?: WebcamStatus;
   captureFrame(): string | null;
   composeBeforeAfter(before: string, after: string): Promise<string | null>;
 }
@@ -255,6 +301,30 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
   }
 
   /**
+   * RC-55. The current camera status, or undefined when there is no camera to
+   * report on.
+   *
+   * The simulated world answers undefined DELIBERATELY, even though the panel
+   * stays mounted there and still holds a status. Its frames come from the HTTP
+   * snapshot source, not from the camera, so the panel's status describes a
+   * device this world is not using: reporting `denied` there would fail-fast a
+   * simulated capture that would have worked perfectly well, and would name a
+   * cause that has nothing to do with why the frame is missing. This mirrors
+   * vue-ui, whose own `createHttpSnapshotCaptureSource` omits the hook for the
+   * same reason.
+   */
+  function cameraStatus(): WebcamStatus | undefined {
+    if (deps.getWorldId() === SIMULATED_WORLD_ID) return undefined;
+    return deps.getWebcamPanel()?.cameraStatus;
+  }
+
+  /** Whether the camera has reported a cause that waiting cannot resolve. */
+  function cannotImprove(): boolean {
+    const status = cameraStatus();
+    return status != null && CAMERA_STATUSES_THAT_CANNOT_IMPROVE.includes(status);
+  }
+
+  /**
    * Poll `attempt` until it yields a value or `deadline` passes, then answer
    * with what it has.
    *
@@ -262,11 +332,22 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
    * ANSWER (null), not an error. Every caller has a gate of its own to fail at,
    * and a rejection escaping from here would be reported to the model as a
    * failed run rather than as a failed capture.
+   *
+   * RC-55: `abort` is an optional second way to stop — "waiting cannot help any
+   * more" — answering null exactly as an expired deadline does, so no caller has
+   * a new outcome to handle. It is checked AFTER `attempt`, which preserves the
+   * try-at-least-once property above: a status that cannot improve still gets
+   * its one shot, so this can only ever remove waiting, never a capture.
    */
-  async function pollUntil<T>(deadline: number, attempt: () => T | null): Promise<T | null> {
+  async function pollUntil<T>(
+    deadline: number,
+    attempt: () => T | null,
+    abort?: () => boolean
+  ): Promise<T | null> {
     for (;;) {
       const value = attempt();
       if (value != null) return value;
+      if (abort?.()) return null;
       if (Date.now() >= deadline) return null;
       await sleep(readyPollMs);
     }
@@ -278,11 +359,20 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
    * live stream is not on its own enough.
    */
   async function captureRealFrame(deadline: number): Promise<string | null> {
-    return pollUntil(deadline, () => {
-      const panel = deps.getWebcamPanel();
-      if (panel == null || !panel.isActive) return null;
-      return decodableFrame(panel);
-    });
+    // RC-55: `cannotImprove` as the abort. A camera that is denied when the call
+    // starts, or whose device is taken away mid-call, is not going to begin
+    // decoding before the deadline, so stop rather than spend the rest of the
+    // budget proving it. Null is already this function's "no frame" answer, so
+    // the caller's gate is unchanged; only the waiting is skipped.
+    return pollUntil(
+      deadline,
+      () => {
+        const panel = deps.getWebcamPanel();
+        if (panel == null || !panel.isActive) return null;
+        return decodableFrame(panel);
+      },
+      cannotImprove
+    );
   }
 
   /** One capture, dispatched on the CURRENT world and bounded by `deadline`. */
@@ -330,13 +420,17 @@ export function createWorldCapabilities(deps: WorldCapabilitiesDeps): BrowserCap
   // error.
   async function beginCall(): Promise<CallScopedCapabilities> {
     const deadline = Date.now() + readyTimeoutMs;
-    await pollUntil(deadline, () => (isReady() ? true : null));
+    // RC-55: this is the wait a denied camera used to spend in full, on every
+    // single tool call, before failing with a sentence that named nothing. A
+    // status that cannot improve stops it at the first check.
+    await pollUntil(deadline, () => (isReady() ? true : null), cannotImprove);
     return { captureFrame: () => captureFrameBy(deadline) };
   }
 
   return {
     isReady,
     beginCall,
+    cameraStatus,
     captureFrame: () => captureFrameBy(Date.now() + readyTimeoutMs),
     composeBeforeAfter: (before, after) =>
       deps.getWebcamPanel()?.composeBeforeAfter(before, after) ?? Promise.resolve(null),

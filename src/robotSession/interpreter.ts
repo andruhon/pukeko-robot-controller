@@ -8,7 +8,12 @@
 // no Vue/DOM dependency of its own — every side-effecting capability is
 // injected via `RobotCapabilities` — so it is unit-testable without mounting
 // the SFC (the whole point of the node).
-import { frameToEnvelope } from '@galvanized-pukeko/vue-ui';
+import {
+  frameToEnvelope,
+  captureFailureMessage,
+  CAPTURE_IMAGE_FAILED_ERROR,
+  type WebcamStatus,
+} from '@galvanized-pukeko/vue-ui';
 import type { RobotToolDef, RecipeStep, HttpPath } from './../agent/robotPresets/types.js';
 
 // The browser-side capabilities the interpreter needs. App.vue supplies these
@@ -48,10 +53,47 @@ export interface RobotCapabilities {
   // truthy, so the null guard passes and a Promise reaches composeBeforeAfter
   // dressed as a `data:` URL. Nothing throws and the composite is simply wrong.
   captureFrame(): string | null | Promise<string | null>;
+  // RC-55: why the camera does or does not have frames, so a failed capture can
+  // name its cause instead of asking the model a question the code has already
+  // answered. Structurally the same optional member as vue-ui's own
+  // ImageCaptureSource.cameraStatus, so the object RobotSession hands to
+  // `captureImageResult` satisfies that shape without an adapter.
+  //
+  // A method, not a property, so it is read at capture time: the status changes
+  // underneath a capability set that lives as long as the app does.
+  //
+  // Optional because a capability set may have no camera to report on — every
+  // test fake, and the simulated world, whose frames come over HTTP. Absent, the
+  // envelope keeps the frozen message byte for byte.
+  cameraStatus?(): WebcamStatus | null | undefined;
   composeBeforeAfter(before: string, after: string): Promise<string | null>;
   fetch: typeof fetch;
   robotUrl(path: string): string;
   robotHost: string;
+}
+
+/**
+ * The capture-failure message for `caps`' current camera status when that
+ * status names a cause, else **null**.
+ *
+ * Null is what keeps `'Webcam not initialized'` in place for every caller that
+ * cannot say why: it means "vue-ui has no better sentence than the frozen one",
+ * not "the camera is fine".
+ *
+ * Membership is DERIVED by asking vue-ui rather than by listing the statuses it
+ * maps. That is the whole point — `captureFailureMessage` is the vocabulary
+ * authority (RC-55), and a local list of which statuses it happens to name today
+ * would be a second copy of that map, free to drift the moment vue-ui adds a
+ * status or rewords one. Comparing its answer against the frozen fallback asks
+ * the authority the question instead of re-deriving it.
+ */
+export function namedCameraFailure(
+  caps: Pick<RobotCapabilities, 'cameraStatus'>
+): string | null {
+  const status = caps.cameraStatus?.();
+  if (!status) return null;
+  const message = captureFailureMessage(status);
+  return message === CAPTURE_IMAGE_FAILED_ERROR ? null : message;
 }
 
 // The subset App.vue actually provides; RobotSession fills in robotUrl/robotHost.
@@ -117,7 +159,18 @@ export async function runRecipe(
   if (!caps.isReady()) {
     // No motion label here — matches the original guard, which fired before
     // the label was computed.
-    return JSON.stringify({ error: 'Webcam not initialized' });
+    //
+    // RC-55: when the camera can say WHY it has no frames, say that instead.
+    // This is the same sentence `RobotSession.captureImage` returns for the same
+    // camera, which is what "the two paths agree about the same failure" means:
+    // a student who is told the permission was denied by one tool is not told
+    // the webcam was never initialised by the other.
+    //
+    // The fallback is unchanged and load-bearing. A capability set that reports
+    // no status — every test fake, the simulated world, a panel too old to
+    // expose one — still gets `'Webcam not initialized'`, because that is the
+    // honest answer when the reason is genuinely unknown.
+    return JSON.stringify({ error: namedCameraFailure(caps) ?? 'Webcam not initialized' });
   }
 
   const steps = coerceSteps(args);

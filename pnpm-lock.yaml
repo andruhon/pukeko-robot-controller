@@ -15,8 +15,8 @@ importers:
         specifier: 1.70.0
         version: 1.70.0(lit@3.3.3)(typescript@5.9.3)(vue@3.5.42(typescript@5.9.3))
       '@galvanized-pukeko/vue-ui':
-        specifier: ^0.2.3
-        version: 0.2.3(@copilotkit/vue@1.70.0(lit@3.3.3)(typescript@5.9.3)(vue@3.5.42(typescript@5.9.3)))(vue@3.5.42(typescript@5.9.3))
+        specifier: ^0.2.4
+        version: 0.2.4(@copilotkit/vue@1.70.0(lit@3.3.3)(typescript@5.9.3)(vue@3.5.42(typescript@5.9.3)))(vue@3.5.42(typescript@5.9.3))
       '@gaunt-sloth/agent':
         specifier: 2.0.0-beta.5
         version: 2.0.0-beta.5(@bufbuild/protobuf@2.14.1)(@cfworker/json-schema@4.1.1)(@langchain/anthropic@1.5.9(@langchain/core@1.2.9(openai@7.8.0(undici@8.10.1)(ws@8.21.3)(zod@3.25.76))(ws@8.21.3)))(@langchain/google@0.1.12(@langchain/core@1.2.9(openai@7.8.0(undici@8.10.1)(ws@8.21.3)(zod@3.25.76))(ws@8.21.3)))(@langchain/ollama@1.2.6(@langchain/core@1.2.9(openai@7.8.0(undici@8.10.1)(ws@8.21.3)(zod@3.25.76))(ws@8.21.3)))(@langchain/openai@1.5.11(@langchain/core@1.2.9(openai@7.8.0(undici@8.10.1)(ws@8.21.3)(zod@3.25.76))(ws@8.21.3))(undici@8.10.1)(ws@8.21.3))(@langchain/openrouter@0.3.0(@langchain/core@1.2.9(openai@7.8.0(undici@8.10.1)(ws@8.21.3)(zod@3.25.76))(ws@8.21.3))(ws@8.21.3)(zod@3.25.76))(openai@7.8.0(undici@8.10.1)(ws@8.21.3)(zod@3.25.76))(ws@8.21.3)
@@ -412,8 +412,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@galvanized-pukeko/vue-ui@0.2.3':
-    resolution: {integrity: sha512-LdG0TgUxC2f9CzisPXTeOTnfD12lCei4J0M3D693Re4RbMqWBeL2/qubZ8GLGo7JKE3rxf6ZjPckWEmk8uVd3w==}
+  '@galvanized-pukeko/vue-ui@0.2.4':
+    resolution: {integrity: sha512-iPHYkGBVP5C6L299cbLwAzCdBEqxPnel4Q3hzh0SnYRFZUQ82uyx5dVe0DKJKSb3E4Tz4b7ozpQUdeP6eRQjtQ==}
     peerDependencies:
       '@copilotkit/vue': ^1.70.0
       vue: ^3.5.12
@@ -3201,7 +3201,7 @@ snapshots:
   '@esbuild/win32-x64@0.28.2':
     optional: true
 
-  '@galvanized-pukeko/vue-ui@0.2.3(@copilotkit/vue@1.70.0(lit@3.3.3)(typescript@5.9.3)(vue@3.5.42(typescript@5.9.3)))(vue@3.5.42(typescript@5.9.3))':
+  '@galvanized-pukeko/vue-ui@0.2.4(@copilotkit/vue@1.70.0(lit@3.3.3)(typescript@5.9.3)(vue@3.5.42(typescript@5.9.3)))(vue@3.5.42(typescript@5.9.3))':
     dependencies:
       '@ag-ui/client': 0.0.59
       chart.js: 4.5.1

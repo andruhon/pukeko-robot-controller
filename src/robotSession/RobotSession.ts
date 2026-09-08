@@ -19,6 +19,7 @@ import { DEFAULT_ROBOT_PRESET_ID, getClientToolDefs } from '../agent/robotPreset
 import type { RobotToolDef } from '../agent/robotPresets/index.js';
 import {
   runRecipe,
+  namedCameraFailure,
   type BrowserCapabilities,
   type RobotCapabilities,
 } from './interpreter.js';
@@ -155,11 +156,34 @@ export class RobotSession {
 
   // The generic single-frame capability (capture_image). PLAT-18: delegates to
   // the shared capture layer in @galvanized-pukeko/vue-ui — `this.caps`
-  // (isReady + captureFrame) already satisfies its ImageCaptureSource shape.
-  // The envelope contract ({mimeType,data}/{error} + the exact error strings)
-  // is frozen there (RC-14 renderers key on it).
+  // (isReady + captureFrame, and since RC-55 the optional cameraStatus) already
+  // satisfies its ImageCaptureSource shape. The envelope SHAPE
+  // ({mimeType,data}/{error}) is frozen there (RC-14 renderers key on it), and
+  // every error string still comes from that package: RC-55 changed which of
+  // its sentences a failure gets, never the wording, and never this repo's.
   async captureImage(): Promise<string> {
-    return captureImageResult(await this.capsForCall());
+    const caps = await this.capsForCall();
+    // RC-55 — why this gate sits HERE, ahead of vue-ui, rather than inside it.
+    //
+    // `captureImageResult` asks `isReady()` FIRST and only consults
+    // `cameraStatus()` after a capture has come back empty. That ordering is
+    // right for vue-ui's own panel source, whose `isReady()` means "a panel is
+    // mounted", so a denied camera reaches the cause-naming branch. It is the
+    // wrong ordering for THIS repo, because RC-53 deliberately narrowed
+    // `isReady()` to "the media stream is flowing" (see worlds.ts, which argues
+    // that at length). A denied camera is therefore not-ready here, and would
+    // short-circuit to `'Webcam not initialized'` — a sentence that names
+    // nothing — without `cameraStatus()` ever being read.
+    //
+    // So the robot answers for the case it can name and delegates every other
+    // case unchanged. Widening `isReady()` back to "panel mounted" would get the
+    // message right by making readiness lie, and would let a motion recipe drive
+    // the robot on a camera that cannot see it.
+    if (!caps.isReady()) {
+      const named = namedCameraFailure(caps);
+      if (named) return JSON.stringify({ error: named });
+    }
+    return captureImageResult(caps);
   }
 
   // The AG-UI run-input tool declarations — the shared capture_image

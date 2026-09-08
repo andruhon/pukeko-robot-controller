@@ -5,6 +5,7 @@ export {
   runRecipe,
   frameToEnvelope,
   coerceSteps,
+  namedCameraFailure,
   type RobotCapabilities,
   type BrowserCapabilities,
   type CallScopedCapabilities,

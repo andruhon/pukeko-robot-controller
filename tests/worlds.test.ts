@@ -598,9 +598,11 @@ describe('RC-53 the real world is ready when its camera is streaming', () => {
 
       await vi.advanceTimersByTimeAsync(30)
       expect(settled).toHaveLength(1)
-      // vue-ui's frozen envelope string. The capture_image half of the wording
-      // lives in that package and is out of this repo's reach; the motion half,
-      // below, is ours and says what actually happened.
+      // vue-ui's frozen envelope string, which is what a capture failure says
+      // when its cause is not knowable. This panel reports no camera status, so
+      // there is nothing to name — RC-55 changed which sentence is chosen, not
+      // this one. A panel that DOES report a cause is covered in
+      // rc55CameraStatus.test.ts.
       expect(JSON.parse(settled[0])).toEqual({
         error: 'Failed to capture frame. Is the camera active?',
       })
