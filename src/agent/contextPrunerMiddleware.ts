@@ -45,6 +45,18 @@ Rules:
 - Do NOT describe raw image content ("the photo shows..."), and do NOT include base64 data or image URLs.
 - Plain text, terse, present tense.`;
 
+/**
+ * The token cap this middleware applies when a profile names none.
+ *
+ * Exported because RC-62's config check in `server/loadConfig.ts` compares a
+ * profile's ollama context window against the budget that will ACTUALLY be in
+ * force, and a profile that omits `contextPruner` still gets this one. A second
+ * copy of the number over there would be one more pair of components
+ * disagreeing about how much context exists, which is the defect that check
+ * exists to report.
+ */
+export const DEFAULT_MAX_CONTEXT_TOKENS = 30_000;
+
 export interface ContextPrunerOptions {
   llm: BaseChatModel;
   // Override for the summarization system prompt. Falls back to a baked-in
@@ -381,7 +393,7 @@ async function runSummary(
 
 export function createContextPrunerMiddleware(opts: ContextPrunerOptions) {
   const summaryPrompt = opts.summaryPrompt ?? DEFAULT_SUMMARY_PROMPT;
-  const maxContextTokens = opts.maxContextTokens ?? 30_000;
+  const maxContextTokens = opts.maxContextTokens ?? DEFAULT_MAX_CONTEXT_TOKENS;
   const summarizeAtFraction = opts.summarizeAtFraction ?? 0.7;
   const keepLatestImages = Math.max(0, opts.keepLatestImages ?? 1);
   const imageTokenBudget = opts.imageTokenBudget ?? 800;

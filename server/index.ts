@@ -10,7 +10,7 @@ import { createLazyToolRecoveryMiddleware } from '../src/agent/lazyToolRecoveryM
 import { createObservabilityMiddleware } from './observabilityMiddleware.js';
 import { createRobotTools } from '../src/agent/robotTools.js';
 import { DEFAULT_ROBOT_PRESET_ID } from '../src/agent/robotPresets/index.js';
-import { loadConfig } from './loadConfig.js';
+import { DEFAULT_MIDDLEWARE, loadConfig } from './loadConfig.js';
 import type { MiddlewareEntry, PukekoProfile } from '../src/lib/config.js';
 import { createLlm } from './createLlm.js';
 
@@ -44,9 +44,11 @@ console.log(
 );
 
 function buildMiddleware(entries: MiddlewareEntry[] | undefined, llm: BaseChatModel, profile: PukekoProfile): unknown[] {
-  // RC-16: the inline default mirrors FALLBACK_PROFILE in loadConfig.ts —
-  // context-pruner, not the deprecated motion-summary (RC-9/RC-12 alignment).
-  const list = entries ?? ['frontend-images', 'context-pruner'];
+  // The default lives in loadConfig.ts, next to the fallback profile that uses
+  // it and the RC-62 check that has to predict it — an inline copy here is a
+  // list this function could quietly build while the check reasoned about a
+  // different one.
+  const list = entries ?? DEFAULT_MIDDLEWARE;
   const built: unknown[] = [];
   const enabled: string[] = [];
   for (const entry of list) {

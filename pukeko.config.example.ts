@@ -23,7 +23,32 @@ export default defineConfig({
   defaultProfile: 'gemma-default',
   profiles: {
     'gemma-default': {
-      llm: { provider: 'ollama', model: 'gemma4:31b' },
+      // gemma4:12b rather than 31b, measured on the dev box (Radeon RX 9060 XT,
+      // 15.9 GiB): 12b loads whole into VRAM — 8.4 GB at the 32768-token window
+      // below, 100% on the GPU, ~4 s to first token. 31b is 21.5 GB loaded, so a
+      // third of it runs on the CPU at ANY window, and widening the window makes
+      // the spill worse (66% → 60% on GPU) because KV cache displaces weights;
+      // 17–19 s to first token. On a card with room for it, 31b is a defensible
+      // choice — but then set it deliberately and expect the CPU spill.
+      llm: {
+        provider: 'ollama',
+        model: 'gemma4:12b',
+        ollama: {
+          // The window the model is actually given (`num_ctx`), and the one key
+          // in this bag that must equal `contextPruner.maxContextTokens` or
+          // better. The pruner lets history grow to that cap; ollama then serves
+          // only its own window and silently discards the rest FROM THE HEAD —
+          // the opening instruction, the framing and the pruner's own summary go
+          // first, with no error. Left unset, a stock server serves 4096 against
+          // the 30000-token budget below; `loadConfig` warns on any such
+          // disagreement rather than letting it run silently.
+          //
+          // 32768 is chosen over the 30000 minimum because ollama's granted
+          // window is a power of two anyway and the difference is free: on 12b,
+          // 4096 → 32768 cost 0.3 GB and stayed 100% on the GPU.
+          numCtx: 32768,
+        },
+      },
       middleware: ['frontend-images', 'context-pruner', 'observability', 'lazy-tool-recovery'],
       contextPruner: PRUNER_LOCAL,
       observability: OBSERVABILITY,
@@ -34,21 +59,28 @@ export default defineConfig({
       // robot: { host: '192.168.4.1', preset: 'ACEBOTT-QD021' }, // overridable with ROBOT_HOST / ROBOT_PRESET
     },
 
-    // Same local model and same middleware as 'gemma-default', differing ONLY in
-    // `llm.ollama` — the generation options, which reach the /api/chat request
-    // (RC-50). Held equal that way, running one profile against the other is a
-    // clean comparison of the sampling settings and nothing else.
+    // Same local model, same window and same middleware as 'gemma-default',
+    // differing ONLY in the SAMPLING options inside `llm.ollama`, which reach the
+    // /api/chat request (RC-50). Held equal that way, running one profile against
+    // the other is a clean comparison of the sampling settings and nothing else.
+    // `numCtx` is in that bag but is not one of the variables: it changes what the
+    // model can SEE rather than how it draws tokens, so it is set identically here
+    // — a window that differed between the two would be the loudest difference in
+    // the experiment while looking like a sampling knob.
     //
     // The VALUES here are illustrative, not recommended: which settings actually
     // help is an open question that needs a human driving the robot and recording
     // both halves — time-to-complete AND whether the robot still reaches the
-    // target. Omit a key to leave ollama's own default in place; a profile that
-    // sets none behaves exactly like 'gemma-default'.
+    // target. Omit a sampling key to leave ollama's own default in place; strip
+    // them all and what is left — numCtx alone — is 'gemma-default'.
     'gemma-tuned': {
       llm: {
         provider: 'ollama',
-        model: 'gemma4:31b',
+        model: 'gemma4:12b',
         ollama: {
+          // Held identical to 'gemma-default' — see the note above the profile,
+          // and the reasoning beside that profile's own numCtx.
+          numCtx: 32768,
           // A switch, not a budget — this suppresses thinking rather than shortening it.
           think: false,
           temperature: 0.6, // the model's own default is 1
@@ -59,13 +91,6 @@ export default defineConfig({
           // passage longer than that is invisible to repeatPenalty. Widen it past
           // the length of whatever is repeating.
           repeatLastN: 512,
-          // `numCtx` is available too and is deliberately NOT set here: it changes
-          // what the model can see rather than how it samples, so setting it would
-          // confound the comparison this profile exists for. It also has to agree
-          // with contextPruner — the pruner summarizes at summarizeAtFraction ×
-          // maxContextTokens (21k with PRUNER_LOCAL), and ollama silently truncates
-          // a prompt longer than num_ctx, so a smaller window drops context with no
-          // error. Move the two together or not at all.
         },
       },
       middleware: ['frontend-images', 'context-pruner', 'observability', 'lazy-tool-recovery'],
