@@ -215,7 +215,12 @@ function findImageHumanMessageIndices(messages: BaseMessage[]): number[] {
 // Token estimator (cheap heuristic — no tokenizer dependency)
 // ────────────────────────────────────────────────────────────────────────────
 
-function textTokens(text: string): number {
+// Exported so `server/loadConfig.ts` can size the system prompt — which rides
+// outside `state.messages` and so never reaches `estimateTokens` — on the same
+// scale the pruner spends its budget on. A second copy of the estimate there
+// would be one more pair of components disagreeing about how much context
+// exists, which is the shape RC-62 exists to report.
+export function textTokens(text: string): number {
   // ~4 chars per token is the canonical rough estimate for English; reasonable
   // for our prompt style across cl100k/o200k/Gemma's SentencePiece.
   return Math.ceil(text.length / 4);

@@ -35,17 +35,25 @@ export default defineConfig({
         model: 'gemma4:12b',
         ollama: {
           // The window the model is actually given (`num_ctx`), and the one key
-          // in this bag that must equal `contextPruner.maxContextTokens` or
-          // better. The pruner lets history grow to that cap; ollama then serves
-          // only its own window and silently discards the rest FROM THE HEAD —
-          // the opening instruction, the framing and the pruner's own summary go
-          // first, with no error. Left unset, a stock server serves 4096 against
-          // the 30000-token budget below; `loadConfig` warns on any such
-          // disagreement rather than letting it run silently.
+          // in this bag that must cover `contextPruner.maxContextTokens` PLUS
+          // the system prompt. The pruner lets history grow to that cap and
+          // budgets only `state.messages`; the system prompt is sent outside
+          // that array and costs window on top of it — roughly 1900 tokens for
+          // the shipped `system-prompt.md`, more if `systemPromptPath` points
+          // somewhere longer. Ollama then serves only its own window and
+          // silently discards the rest FROM THE HEAD — the opening instruction,
+          // the framing and the pruner's own summary go first, with no error.
+          // Left unset, a stock server serves 4096 against the 30000-token
+          // budget below; `loadConfig` warns on any such disagreement, sizing
+          // the prompt from the profile's own file rather than assuming this
+          // one.
           //
-          // 32768 is chosen over the 30000 minimum because ollama's granted
-          // window is a power of two anyway and the difference is free: on 12b,
-          // 4096 → 32768 cost 0.3 GB and stayed 100% on the GPU.
+          // So the minimum here is not 30000 — it is 30000 plus the prompt, and
+          // the ~2800 tokens between that budget and 32768 are what pays for it.
+          // THAT MARGIN IS LOAD-BEARING: do not tidy this number down to the
+          // budget. 32768 costs nothing to prefer — ollama's granted window is a
+          // power of two anyway, and on 12b, 4096 → 32768 cost 0.3 GB and stayed
+          // 100% on the GPU.
           numCtx: 32768,
         },
       },

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ChatOllama } from '@langchain/ollama'
@@ -18,6 +18,19 @@ import exampleConfig from '../pukeko.config.example.js'
  * framing, and the pruner's own summary, which exists precisely so the early
  * history survives in compressed form. Neither component reported anything,
  * because neither knew the other's number.
+ *
+ * **The window the profile needs is the budget PLUS the system prompt.** The
+ * pruner budgets `state.messages`; the prompt goes to `createAgent` as
+ * `systemPrompt` and is applied outside that array, so it was in nobody's
+ * budget. Comparing the window against `maxContextTokens` alone let the check
+ * bless the configuration its own remedy produced — it told the reader to raise
+ * `numCtx` to 30000, and then had no opinion about the truncating window that
+ * produced. That is why the headroom is READ FROM THE PROFILE'S OWN PROMPT FILE
+ * rather than written down as a constant: `systemPromptPath` lets a profile
+ * point anywhere, and a constant would be right for the shipped file and wrong
+ * for every override — the same defect one layer down. The custom-path cell
+ * below is what makes that distinction testable; a constant passes every other
+ * cell in this file.
  *
  * Two kinds of assertion here, and they answer different questions:
  *
@@ -71,22 +84,76 @@ function localProfile(overrides: Partial<PukekoProfile> = {}): PukekoProfile {
   }
 }
 
+/**
+ * A prompt root these branch tests own, holding a prompt of a length chosen by
+ * hand: 8000 characters is 2000 tokens at the pruner's ceil(chars/4), so the
+ * required window is a round 32000 against the 30000 budget.
+ *
+ * Deliberately NOT the repo's real `system-prompt.md`. That file is prose people
+ * edit, and pinning exact expectations to its current length would make every
+ * cell here fail on an unrelated wording change. The shipped-profile group below
+ * is the one place the live file is read, and it says so.
+ */
+const PROMPT_CHARS = 8000
+const PROMPT_TOKENS = 2000
+const BUDGET = 30_000
+const REQUIRED = BUDGET + PROMPT_TOKENS
+
 describe('RC-62 — contextWindowWarning', () => {
+  let promptRoot: string
+
+  beforeEach(() => {
+    promptRoot = mkdtempSync(join(tmpdir(), 'pukeko-rc62-prompt-'))
+    writeFileSync(join(promptRoot, 'system-prompt.md'), 'x'.repeat(PROMPT_CHARS))
+  })
+
+  afterEach(() => {
+    rmSync(promptRoot, { recursive: true, force: true })
+  })
+
+  /** The check as production calls it, but rooted at this test's prompt dir. */
+  function warn(name: string, profile: PukekoProfile): string | null {
+    return contextWindowWarning(name, profile, promptRoot)
+  }
+
   it('reports a profile that sends no num_ctx, naming the server default it will get', () => {
     // The exact shape this repo shipped: `gemma-default` had no `llm.ollama`
     // block at all, so the request body was `{"model":…,"options":{}}` and the
     // window was whatever ollama chose. The warning has to fire here — an
     // absent key is the common way to disagree, not an edge case — and it has
     // to name the absence rather than pretend a number was configured.
-    const warning = contextWindowWarning('gemma-default', localProfile())
+    const warning = warn('gemma-default', localProfile())
 
     expect(warning).toContain(`profile 'gemma-default' sends no llm.ollama.numCtx`)
     expect(warning).toContain('4096')
     expect(warning).toContain('maxContextTokens=30000')
-    // Both numbers AND the consequence: 30000 − 4096 tokens the pruner elected
-    // to keep can be thrown away by the server.
-    expect(warning).toContain('Up to 25904 tokens')
+    // The requirement it names is the budget plus the prompt, not the budget.
+    expect(warning).toContain(`needs a window of at least ${REQUIRED} tokens`)
+    expect(warning).toContain(`adds about ${PROMPT_TOKENS} on top of it`)
     expect(warning).toContain('HEAD')
+    // The remedy has to name the window that actually works. Naming 30000 here
+    // is the defect: a reader who does exactly that still truncates, and this
+    // check then goes silent on the result.
+    expect(warning).toContain(`Raise llm.ollama.numCtx to at least ${REQUIRED}`)
+    expect(warning).not.toContain('at least 30000')
+    // On this path there is no config file, so the two keys the remedy names
+    // may not exist to edit; the one lever that path has must appear as a
+    // remedy and not only in the condition clause.
+    expect(warning).toContain('OLLAMA_CONTEXT_LENGTH on the ollama server is the lever')
+  })
+
+  it('does not promise an upper bound on what is discarded, because none is enforced', () => {
+    // `maxContextTokens` is read in exactly three places
+    // (contextPrunerMiddleware.ts: the option default, the summarize threshold,
+    // and a log line) and is never a cap the pruner enforces — that file's own
+    // notes record rebuilds reaching 30003 and 31060 against it. So "up to N
+    // tokens can be discarded" was a false ceiling, and swapping in a corrected
+    // N would keep the falsehood and change only the number.
+    const warning = warn('gemma-default', localProfile())
+
+    expect(warning).not.toMatch(/Up to \d+ tokens/)
+    expect(warning).toContain('not bounded by the gap between these numbers')
+    expect(warning).toContain('summarize threshold rather than a ceiling')
   })
 
   it('reports a numCtx that is set but too small, and does not blame an absent key', () => {
@@ -94,24 +161,31 @@ describe('RC-62 — contextWindowWarning', () => {
     // different sentence rather than a paraphrase covering both. Naming the
     // server default here would be a false statement: this profile does send a
     // window, it is just too narrow.
-    const warning = contextWindowWarning(
+    const warning = warn(
       'gemma-tuned',
       localProfile({ llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: 8192 } } })
     )
 
     expect(warning).toContain('sets llm.ollama.numCtx=8192')
     expect(warning).toContain('maxContextTokens=30000')
-    expect(warning).toContain('Up to 21808 tokens')
+    expect(warning).toContain(`Raise llm.ollama.numCtx to at least ${REQUIRED}`)
+    // The other direction of the fix, and it must subtract the prompt too:
+    // 8192 − 2000. A budget lowered to the raw window would truncate again.
+    expect(warning).toContain('lower contextPruner.maxContextTokens to 6192 or less')
     expect(warning).not.toContain('sends no llm.ollama.numCtx')
     expect(warning).not.toContain('4096')
+    // This profile HAS a config file with the key in it, and an explicit
+    // num_ctx in the request is not the server default. Offering the env var
+    // here would be a remedy for a condition that does not hold.
+    expect(warning).not.toContain('OLLAMA_CONTEXT_LENGTH')
   })
 
-  it('SAYS NOTHING when the window covers the budget — the control', () => {
+  it('SAYS NOTHING when the window covers the budget AND the prompt — the control', () => {
     // The assertion the rest of this file exists to protect. Every positive
     // case above passes just as well under a check that warns unconditionally;
     // only this one can tell the two apart.
     expect(
-      contextWindowWarning(
+      warn(
         'gemma-default',
         localProfile({
           llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: 32768 } },
@@ -120,33 +194,121 @@ describe('RC-62 — contextWindowWarning', () => {
     ).toBeNull()
   })
 
-  it('treats an exactly-equal window as agreement, and one token less as disagreement', () => {
+  it('WARNS on a window exactly equal to maxContextTokens — the configuration the old remedy produced', () => {
+    // The acceptance for this fix, and it is red on the previous code, which
+    // tested `window >= budget` and returned null here.
+    //
+    // 30000 is not an arbitrary number: it is precisely what the warning used
+    // to tell the reader to set. Following the remedy exactly landed on a
+    // window with no room for the ~2000-token prompt that is sent outside the
+    // pruned history — so the run still truncated, and the check that sent them
+    // there had nothing further to say about it.
+    const warning = warn(
+      'followed-the-old-remedy',
+      localProfile({
+        llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: BUDGET } },
+      })
+    )
+
+    expect(warning).toContain(`sets llm.ollama.numCtx=${BUDGET}`)
+    expect(warning).toContain(`needs a window of at least ${REQUIRED} tokens`)
+  })
+
+  it('treats a window equal to budget-plus-prompt as agreement, and one token less as disagreement', () => {
     // Pins the direction and the boundary of the comparison. A `>` where `>=`
     // belongs would warn about a profile that is exactly right, and the
     // once-per-start warning would then be noise a reader learns to ignore.
-    const exact = contextWindowWarning(
+    const exact = warn(
       'exact',
       localProfile({
-        llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: 30_000 } },
+        llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: REQUIRED } },
       })
     )
     expect(exact).toBeNull()
 
-    const short = contextWindowWarning(
+    const short = warn(
       'short',
       localProfile({
-        llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: 29_999 } },
+        llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: REQUIRED - 1 } },
       })
     )
-    expect(short).toContain('Up to 1 tokens')
+    expect(short).toContain(`sets llm.ollama.numCtx=${REQUIRED - 1}`)
+  })
+
+  it('sizes the headroom from the profile OWN prompt file, not from a constant', () => {
+    // The cell that decides the design. A hardcoded headroom — even one that is
+    // exactly right for the shipped prompt — passes every other assertion in
+    // this file and fails here, because `systemPromptPath` lets a profile point
+    // at a file of any size. That is the same class of error this node is
+    // fixing: a number that is true for one configuration stated as if it were
+    // true for all of them.
+    writeFileSync(join(promptRoot, 'big-prompt.md'), 'y'.repeat(40_000))
+
+    const warning = warn('big-prompt', localProfile({
+      systemPromptPath: 'big-prompt.md',
+      llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: 32768 } },
+    }))
+
+    // 40000 chars is 10000 tokens, so this profile needs 40000 — and the 32768
+    // that is comfortably enough for the default prompt is not enough here.
+    expect(warning).toContain('needs a window of at least 40000 tokens')
+    expect(warning).toContain('adds about 10000 on top of it')
+    expect(warning).toContain('big-prompt.md')
+
+    // The same window, same budget, default prompt: silent. Both halves are
+    // needed — a check that warned on everything would pass the assertion above.
+    expect(
+      warn('default-prompt', localProfile({
+        llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: 32768 } },
+      }))
+    ).toBeNull()
+  })
+
+  it('does not turn an unreadable prompt file into a startup failure, and says so instead of quoting a number', () => {
+    // A missing prompt must not crash config load, so the headroom degrades to
+    // zero and the comparison falls back to the budget alone. The text then has
+    // to admit that rather than print "adds about 0 tokens", because the real
+    // overhead is not zero — it is unknown, and above whatever is counted.
+    rmSync(join(promptRoot, 'system-prompt.md'))
+
+    const warning = warn('no-prompt-file', localProfile())
+
+    expect(warning).toContain('no prompt file could be read at system-prompt.md')
+    expect(warning).toContain(`needs a window of at least ${BUDGET} tokens`)
+    expect(warning).not.toContain('adds about')
+
+    // And with the window over the budget it is silent — same as the check did
+    // before the prompt was counted, which is all it can honestly claim here.
+    expect(
+      warn('no-prompt-file', localProfile({
+        llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: BUDGET } },
+      }))
+    ).toBeNull()
+  })
+
+  it('offers no negative budget when the prompt alone overruns the window', () => {
+    // `window − promptTokens` is the second remedy, and it is only a remedy
+    // while it is positive. With a prompt longer than the whole window there is
+    // no budget to lower to, and printing "lower maxContextTokens to −1808" is
+    // the kind of sentence this node exists to keep out of the log.
+    writeFileSync(join(promptRoot, 'huge-prompt.md'), 'z'.repeat(40_000))
+
+    const warning = warn('huge-prompt', localProfile({ systemPromptPath: 'huge-prompt.md' }))
+
+    expect(warning).toContain('needs a window of at least 40000 tokens')
+    expect(warning).not.toContain('lower contextPruner.maxContextTokens')
+    expect(warning).not.toMatch(/-\d/)
   })
 
   it('says nothing about a hosted profile, which has no num_ctx to compare', () => {
     // 130000 against a provider that takes no window setting is not a
     // disagreement — it is a profile this check has no opinion about. Warning
     // here would fire on every hosted profile in the example config.
+    // Also a control the headroom arithmetic must not reach: this returns
+    // before the prompt is ever sized, so it must survive every mutation to
+    // that arithmetic.
     expect(
-      contextWindowWarning('anthropic', {
+      warn('anthropic', {
         llm: { provider: 'anthropic', model: 'claude-sonnet-4-6', cache: true },
         middleware: ['frontend-images', 'context-pruner', 'observability'],
         contextPruner: { maxContextTokens: 130_000, summarizeAtFraction: 0.7 },
@@ -158,9 +320,9 @@ describe('RC-62 — contextWindowWarning', () => {
     // With the pruner absent, `contextPruner` on the profile is inert: nothing
     // is sizing history against 30000, so there is no second opinion for the
     // window to disagree with.
-    expect(
-      contextWindowWarning('no-pruner', localProfile({ middleware: ['frontend-images'] }))
-    ).toBeNull()
+    // The second control that returns before the headroom arithmetic, and so
+    // must survive every mutation to it.
+    expect(warn('no-pruner', localProfile({ middleware: ['frontend-images'] }))).toBeNull()
   })
 
   it('reports a profile that names no middleware, because the default stack includes the pruner', () => {
@@ -168,7 +330,7 @@ describe('RC-62 — contextWindowWarning', () => {
     // ['frontend-images', 'context-pruner'], so an unset `middleware` means the
     // pruner IS in force. A check that read an unset list as "no pruner" would
     // stay silent on exactly the configs nobody has tuned.
-    const warning = contextWindowWarning('bare', localProfile({ middleware: undefined }))
+    const warning = warn('bare', localProfile({ middleware: undefined }))
     expect(warning).toContain('maxContextTokens=30000')
   })
 
@@ -178,9 +340,9 @@ describe('RC-62 — contextWindowWarning', () => {
     // that default from the middleware rather than re-typing it: a second copy
     // would be one more pair of components disagreeing about how much context
     // exists, which is the shape it was written to report.
-    const warning = contextWindowWarning('bare', localProfile({ contextPruner: undefined }))
+    const warning = warn('bare', localProfile({ contextPruner: undefined }))
     expect(warning).toContain('maxContextTokens=30000')
-    expect(warning).toContain('Up to 25904 tokens')
+    expect(warning).toContain(`needs a window of at least ${REQUIRED} tokens`)
   })
 })
 
@@ -229,6 +391,41 @@ describe('RC-62 — the check is installed in loadConfig', () => {
     // path rather than on the pure function alone.
     writeConfig({
       llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: 32768 } },
+      contextPruner: { maxContextTokens: 30_000 },
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    await loadConfig(tmpDir)
+
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('sizes the prompt against the loader own root, so a real prompt file moves the threshold', async () => {
+    // Both cells above run in a tmpdir with no prompt file, where the headroom
+    // is zero and the threshold is the bare budget — so they would pass
+    // unchanged if the prompt were never read at all. This is the end-to-end
+    // cell that puts a prompt file on the path `loadConfig` resolves from, and
+    // watches a window that used to be enough stop being enough.
+    writeFileSync(join(tmpDir, 'system-prompt.md'), 'x'.repeat(8000))
+    writeConfig({
+      llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: 30_000 } },
+      contextPruner: { maxContextTokens: 30_000 },
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    await loadConfig(tmpDir)
+
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0]?.[0])).toContain('needs a window of at least 32000 tokens')
+  })
+
+  it('says nothing at config load once the window covers the prompt too', async () => {
+    // The paired control for the cell above: same prompt file, same budget, a
+    // window raised to what the warning actually asks for. Without this, a
+    // check that had started firing on every ollama profile would still pass.
+    writeFileSync(join(tmpDir, 'system-prompt.md'), 'x'.repeat(8000))
+    writeConfig({
+      llm: { provider: 'ollama', model: 'gemma4:12b', ollama: { numCtx: 32_000 } },
       contextPruner: { maxContextTokens: 30_000 },
     })
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -299,8 +496,43 @@ describe('RC-62 — the shipped local profiles', () => {
   })
 
   it('neither local profile warns — the shipped control', () => {
-    expect(contextWindowWarning('gemma-default', local['gemma-default'])).toBeNull()
-    expect(contextWindowWarning('gemma-tuned', local['gemma-tuned'])).toBeNull()
+    // No explicit root: these run at the repo root, against the live
+    // `system-prompt.md`, which is the configuration a contributor actually
+    // starts the server in. The cell below says what to do when this one fires.
+    const guidance =
+      'the shipped numCtx no longer covers maxContextTokens plus the live system-prompt.md — ' +
+      'see the margin assertion in the next cell for the numbers and the remedy'
+    expect(contextWindowWarning('gemma-default', local['gemma-default']), guidance).toBeNull()
+    expect(contextWindowWarning('gemma-tuned', local['gemma-tuned']), guidance).toBeNull()
+  })
+
+  it('the shipped window still covers the live system-prompt.md, and names the slack when it stops', () => {
+    // The one cell in this file that reads the repo's real prompt file, and the
+    // one that will fire on an unrelated change: `system-prompt.md` is prose,
+    // edited for behavioural reasons by people who are not thinking about
+    // context budgets. A bare `expected null` in that PR is close to
+    // undiagnosable, so this states the cause and the remedy in the failure
+    // message itself.
+    //
+    // The token estimate is written out here rather than imported, so that a
+    // change to the pruner's estimator cannot move this expectation with it.
+    const promptChars = readFileSync('system-prompt.md', 'utf8').length
+    const promptTokens = Math.ceil(promptChars / 4)
+    const required = 30_000 + promptTokens
+    const shipped = 32_768
+
+    expect(local['gemma-default'].llm.ollama?.numCtx).toBe(shipped)
+    expect(local['gemma-tuned'].llm.ollama?.numCtx).toBe(shipped)
+    expect(local['gemma-default'].contextPruner?.maxContextTokens).toBe(30_000)
+
+    expect(
+      shipped - required,
+      `system-prompt.md has grown to ${promptChars} characters (~${promptTokens} tokens), so a ` +
+        `local profile now needs a window of ${required}. The shipped numCtx of ${shipped} no ` +
+        `longer covers it, and the server would silently truncate from the head. Raise numCtx on ` +
+        `both local profiles in pukeko.config.example.ts. Do NOT lower the pruner budget to fit ` +
+        `and do NOT relax this assertion — the margin is what makes the shipped profiles correct.`
+    ).toBeGreaterThanOrEqual(0)
   })
 
   it('the two local profiles differ ONLY in their sampling options', () => {

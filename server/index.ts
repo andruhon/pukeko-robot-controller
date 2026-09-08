@@ -10,7 +10,7 @@ import { createLazyToolRecoveryMiddleware } from '../src/agent/lazyToolRecoveryM
 import { createObservabilityMiddleware } from './observabilityMiddleware.js';
 import { createRobotTools } from '../src/agent/robotTools.js';
 import { DEFAULT_ROBOT_PRESET_ID } from '../src/agent/robotPresets/index.js';
-import { DEFAULT_MIDDLEWARE, loadConfig } from './loadConfig.js';
+import { DEFAULT_MIDDLEWARE, DEFAULT_SYSTEM_PROMPT_FILE, loadConfig } from './loadConfig.js';
 import type { MiddlewareEntry, PukekoProfile } from '../src/lib/config.js';
 import { createLlm } from './createLlm.js';
 
@@ -20,7 +20,9 @@ import { createLlm } from './createLlm.js';
 const PORT = Number(process.env.AGUI_PORT) || 3000;
 const WEB_ORIGIN = process.env.WEB_ORIGIN || 'http://localhost:5173';
 const DEFAULT_ROBOT_HOST = '192.168.4.1';
-const DEFAULT_SYSTEM_PROMPT_FILE = 'system-prompt.md';
+// DEFAULT_SYSTEM_PROMPT_FILE is imported from loadConfig.ts, where the RC-62
+// window check has to size the very file this line loads — a copy here is a
+// prompt this server could quietly load while the check measured another.
 const DEFAULT_SUMMARY_PROMPT_FILE = 'summarization-prompt.md';
 
 // Read a prompt file relative to the project root. Returns undefined when the
