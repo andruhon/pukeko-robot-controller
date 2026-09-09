@@ -127,7 +127,7 @@ interface MaybeToolUseBlock extends MaybeBlock {
 }
 
 // Drop `tool_use` content blocks (Anthropic's native AIMessage content shape)
-// whose id is not in `keepIds`, mirroring the `.tool_calls` filter so a rebuilt
+// whose id is not in `keepIds`, mirroring the `.tool_calls` filter so a stripped
 // AIMessage never carries an unpaired tool_use in *either* representation.
 // Also reports the ids of the surviving `tool_use` blocks, so the caller can
 // keep their `tool_result`s even when the id lives only in `content` (not
@@ -156,7 +156,8 @@ function filterToolUseBlocks(
 //
 // Pure and side-effect free (mirrors the pruning helpers in
 // contextPrunerMiddleware). Fully-paired histories pass through with their
-// original message instances preserved.
+// original message instances preserved; a message that loses a call comes back
+// as a copy of itself, never a rebuild — see the AIMessage arm.
 export function stripUnpairedToolCalls(messages: BaseMessage[]): BaseMessage[] {
   // A tool_call is "resolved" iff some ToolMessage carries its id.
   const resolvedIds = new Set<string>();
@@ -206,15 +207,39 @@ export function stripUnpairedToolCalls(messages: BaseMessage[]): BaseMessage[] {
       if (keptCalls.length === 0 && !hasContent) continue;
 
       recordKept();
-      out.push(
-        new AIMessage({
-          content: keptContent,
-          tool_calls: keptCalls,
-          name: ai.name,
-          additional_kwargs: ai.additional_kwargs,
-          id: ai.id,
-        })
-      );
+      // COPIED, never re-described — a prototype-preserving clone of the
+      // message's own property descriptors with only the two fields this
+      // function rewrites replaced: the same shape as stripImageBlocks above
+      // and the three strips in contextPrunerMiddleware. The literal rebuild
+      // this replaces named five fields by hand, so `response_metadata`,
+      // `usage_metadata` and `invalid_tool_calls` were dropped from every
+      // message it touched, a streamed AIMessageChunk lost `tool_call_chunks`
+      // and was flattened into a plain AIMessage, and every field added
+      // upstream later would have gone the same way. It was also the one
+      // rebuild left downstream of stripImageBlocks, so "every field survives
+      // the strip" held while "every field survives the pipeline" did not.
+      //
+      // `lc_kwargs` is replaced on the same terms as every strip here: a
+      // descriptor clone shares that bag with the source BY REFERENCE, and it
+      // still holds the unpaired `tool_calls` and `tool_use` block this
+      // function exists to drop. Here that is sharper than a retained frame —
+      // a serializer resolving values from `lc_kwargs` rather than the live
+      // field would put the unpaired call straight back into the summarizer
+      // payload, which is the INVALID_TOOL_RESULTS shape this whole function
+      // exists to prevent.
+      //
+      // Only `.tool_calls` and the `tool_use` content blocks are filtered. A
+      // chunk's `tool_call_chunks` is carried across whole, like every other
+      // field: narrowing that too would be a behaviour change this function
+      // was not asked to make.
+      const copy = Object.create(
+        Object.getPrototypeOf(ai) as object,
+        Object.getOwnPropertyDescriptors(ai)
+      ) as AIMessage;
+      copy.content = keptContent;
+      copy.tool_calls = keptCalls;
+      copy.lc_kwargs = { ...ai.lc_kwargs, content: keptContent, tool_calls: keptCalls };
+      out.push(copy);
       continue;
     }
 
