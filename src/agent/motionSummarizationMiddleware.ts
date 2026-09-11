@@ -201,6 +201,26 @@ export function stripUnpairedToolCalls(messages: BaseMessage[]): BaseMessage[] {
       const keptChunks = chunks?.filter((c) => c.id != null && resolvedIds.has(c.id));
       const chunksChanged = chunks !== undefined && (keptChunks?.length ?? 0) !== chunks.length;
 
+      // `invalid_tool_calls` is the FOURTH representation, and it is filtered on
+      // the same `resolvedIds` set for the same reason: when a streamed chunk's
+      // `args` are unparseable the constructor routes the call there WITH its id
+      // and leaves `.tool_calls` EMPTY, so an unpaired malformed call is
+      // invisible to the `.tool_calls` filter and rides out the strip whole.
+      // Measured on @langchain/core 1.2.9: the id reaches `lc_kwargs`,
+      // `toJSON()` and `toDict()` by a path the other three filters never touch.
+      //
+      // The field is typed `InvalidToolCall[] | undefined` and every message the
+      // constructor builds defaults it to `[]`, so the undefined case is not
+      // hypothetical bookkeeping: a message rebuilt from the wire can arrive
+      // without it, and the write below is guarded so such a message does not
+      // ACQUIRE the key. A class check is forbidden here anyway (RC-21, RC-58).
+      //
+      // An id-less invalid call is dropped by the same predicate, as a call no
+      // `tool_result` can ever pair with.
+      const invalid = ai.invalid_tool_calls;
+      const keptInvalid = invalid?.filter((c) => c.id != null && resolvedIds.has(c.id));
+      const invalidChanged = invalid !== undefined && (keptInvalid?.length ?? 0) !== invalid.length;
+
       // A surviving tool_use may live in `.tool_calls`, in the `content` blocks,
       // or both. Track EVERY kept id from both representations so the two can't
       // diverge — otherwise a content-block tool_use kept here whose id is not
@@ -211,12 +231,16 @@ export function stripUnpairedToolCalls(messages: BaseMessage[]): BaseMessage[] {
         for (const id of keptBlockIds) keptCallIds.add(id);
       };
 
-      // `chunksChanged` belongs in this guard too: a message whose only stale
-      // representation is the chunk array is exactly the half-stripped state
-      // this closes, and returning it unchanged would leave the two
-      // representations disagreeing. A fully-paired history still passes
-      // through by identity, because then nothing changed in any of the three.
-      if (keptCalls.length === calls.length && !contentChanged && !chunksChanged) {
+      // `chunksChanged` and `invalidChanged` belong in this guard too: a message
+      // whose only stale representation is the chunk array — or the invalid
+      // array — is exactly the half-stripped state this closes, and returning it
+      // unchanged would leave the representations disagreeing. `invalidChanged`
+      // is not made redundant by `chunksChanged`: an unpaired malformed call can
+      // arrive with NO `tool_call_chunks` at all (a settled AIMessage carrying
+      // `invalid_tool_calls` directly), and then the invalid array is the only
+      // representation that disagrees. A fully-paired history still passes
+      // through by identity, because then nothing changed in any of the four.
+      if (keptCalls.length === calls.length && !contentChanged && !chunksChanged && !invalidChanged) {
         recordKept();
         out.push(m);
         continue;
@@ -252,20 +276,31 @@ export function stripUnpairedToolCalls(messages: BaseMessage[]): BaseMessage[] {
       // payload, which is the INVALID_TOOL_RESULTS shape this whole function
       // exists to prevent.
       //
-      // All THREE representations of a tool call are filtered on the one
-      // `resolvedIds` set — `.tool_calls`, the `tool_use` content blocks, and a
-      // chunk's `.tool_call_chunks` — so no two of them can disagree about
-      // which calls the message still carries. Every other field is carried
-      // across whole.
+      // All FOUR representations of a tool call are filtered on the one
+      // `resolvedIds` set — `.tool_calls`, the `tool_use` content blocks, a
+      // chunk's `.tool_call_chunks`, and `.invalid_tool_calls` — so no two of
+      // them can disagree about which calls the message still carries. Every
+      // other field is carried across whole.
       //
-      // One representation is deliberately NOT filtered, and it is recorded
-      // here so the omission is not read as an oversight: when a chunk's `args`
-      // are unparseable the constructor routes the call to
-      // `.invalid_tool_calls` WITH its id and leaves `.tool_calls` empty, so
-      // that id survives a strip in a fourth place. Filtering it is a
-      // behaviour change beyond what this function was asked to make — it would
-      // also have to decide whether such a call's `tool_result` may be kept —
-      // so it is left to its own node rather than folded in here.
+      // ONE CASE IS DELIBERATELY LEFT AS IT IS, and it is asserted in the suite
+      // rather than merely described here: a malformed call that IS paired keeps
+      // its `invalid_tool_calls` entry (its id is resolved, so the filter keeps
+      // it) and its `tool_result` is still DROPPED, because an empty
+      // `.tool_calls` sends the message out by the identity return above without
+      // recording anything into `keptCallIds`.
+      //
+      // That is correct rather than merely tolerated, and the reason is a
+      // measurement, not taste: NO input converter of any provider this repo
+      // constructs reads `invalid_tool_calls` (Ollama, Anthropic, OpenAI,
+      // OpenRouter, Google — every hit in their dists is in a
+      // response-to-message converter on the OUTPUT path), and `contentBlocks`
+      // does not surface it for any `model_provider` tag. So a malformed call
+      // puts NO `tool_use` on the wire, and KEEPING its `tool_result` is what
+      // would manufacture an INVALID_TOOL_RESULTS shape — an orphan
+      // `tool_result` with nothing to pair with. Dropping it leaves the wire
+      // consistent. If a converter ever starts reading the field, this pairing
+      // has to be revisited: then the kept entry becomes a real `tool_use` and
+      // the dropped result becomes the unpaired half.
       const copy = Object.create(
         Object.getPrototypeOf(ai) as object,
         Object.getOwnPropertyDescriptors(ai)
@@ -274,15 +309,22 @@ export function stripUnpairedToolCalls(messages: BaseMessage[]): BaseMessage[] {
       copy.tool_calls = keptCalls;
       // The key is added to the live field and to the bag only when the source
       // actually carried it, so a plain AIMessage does not acquire a
-      // `tool_call_chunks` it never had.
+      // `tool_call_chunks` it never had. `invalid_tool_calls` is written on the
+      // same terms and for the same reason: every message the constructor
+      // builds has it, but one rebuilt from the wire need not, and an unguarded
+      // write would change what such a message serializes to.
       if (keptChunks !== undefined) {
         (copy as typeof chunked).tool_call_chunks = keptChunks;
+      }
+      if (keptInvalid !== undefined) {
+        copy.invalid_tool_calls = keptInvalid;
       }
       copy.lc_kwargs = {
         ...ai.lc_kwargs,
         content: keptContent,
         tool_calls: keptCalls,
         ...(keptChunks !== undefined ? { tool_call_chunks: keptChunks } : {}),
+        ...(keptInvalid !== undefined ? { invalid_tool_calls: keptInvalid } : {}),
       };
       out.push(copy);
       continue;

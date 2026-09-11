@@ -1205,14 +1205,19 @@ describe('motionSummarizationMiddleware — RC-64 the whole summarizer pipeline 
     expect(built.find((m) => m.id === 'tm-paired')).toBe(pairedResult)
   })
 
-  it('a chunk is stripped even when tool_call_chunks is the ONLY representation that disagrees', () => {
+  it('a chunk is stripped when `.tool_calls` is empty and only the chunk and invalid arrays disagree', () => {
     // When a streamed chunk's `args` are unparseable the constructor routes the
     // call to `invalid_tool_calls` and leaves `.tool_calls` EMPTY. So
-    // `keptCalls.length === calls.length` holds, the content is unchanged, and
-    // the chunk array is the only representation carrying the unpaired call —
-    // the case that decides whether the early "nothing changed" return has to
-    // consider the third representation. Without that, this message comes back
-    // as the same instance with the unpaired chunk still on it.
+    // `keptCalls.length === calls.length` holds and the content is unchanged,
+    // and the unpaired call is carried ONLY by the third and fourth
+    // representations — the case that decides whether the early "nothing
+    // changed" return has to consider them. Without that, this message comes
+    // back as the same instance with the unpaired call still on it.
+    //
+    // The title says "the chunk and invalid arrays" rather than naming one of
+    // them alone because this fixture disagrees in BOTH: the constructor writes
+    // the malformed call to `invalid_tool_calls` as well as keeping the chunk.
+    // The RC-67 describe block below covers the invalid array disagreeing ALONE.
     const chunk = new AIMessageChunk({
       id: 'ai-chunk',
       content: [{ type: 'text', text: 'partial' }],
@@ -1243,13 +1248,17 @@ describe('motionSummarizationMiddleware — RC-64 the whole summarizer pipeline 
     // The source is untouched.
     expect(chunk.tool_call_chunks?.map((c) => c.id)).toEqual([UNPAIRED])
 
-    // KNOWN RESIDUAL, pinned deliberately so it is found rather than
-    // rediscovered: a malformed call keeps its id in `invalid_tool_calls`, a
-    // FOURTH representation this function does not filter. Narrowing that is a
-    // behaviour change beyond this strip — it would also have to decide whether
-    // such a call's `tool_result` may be kept — so it is left to its own node.
-    // This assertion is what will red when that node lands.
-    expect(JSON.stringify(out.invalid_tool_calls)).toContain(UNPAIRED)
+    // RC-67 FLIPPED THIS. It stood as the pin on a known residual — the
+    // unpaired malformed call kept its id in `invalid_tool_calls`, the FOURTH
+    // representation — and RC-67 filters that field on the same `resolvedIds`
+    // set, so the id is now gone from the live field and from the bag that
+    // feeds both serialized forms.
+    expect(JSON.stringify(out.invalid_tool_calls)).not.toContain(UNPAIRED)
+    expect(JSON.stringify(out.lc_kwargs.invalid_tool_calls)).not.toContain(UNPAIRED)
+    expect(JSON.stringify(out.toJSON())).not.toContain(UNPAIRED)
+    expect(JSON.stringify(out.toDict())).not.toContain(UNPAIRED)
+    // The source is untouched in the fourth representation too.
+    expect(JSON.stringify(chunk.invalid_tool_calls)).toContain(UNPAIRED)
   })
 
   it('a plain AIMessage does not ACQUIRE a tool_call_chunks it never had', () => {
@@ -1437,5 +1446,218 @@ describe('motionSummarizationMiddleware — RC-64 the whole summarizer pipeline 
     expect(isForeignToThisCore(out)).toBe(true)
     expect(out.id).toBe('ai-foreign')
     expect(out.response_metadata).toEqual({ bridge: 'robot-bridge/2' })
+  })
+})
+
+describe('motionSummarizationMiddleware — RC-67 invalid_tool_calls, the fourth representation', () => {
+  const MALFORMED = 'tc-malformed-motion'
+  const hasOwn = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k)
+
+  // A settled AIMessage carrying `invalid_tool_calls` DIRECTLY, with no
+  // `tool_call_chunks` at all — the shape a rebuilt/settled message takes, and
+  // the one where the invalid array is the ONLY representation that disagrees.
+  function settledWithInvalid(id: string, content: unknown) {
+    return new AIMessage({
+      id: 'ai-settled',
+      content: content as never,
+      invalid_tool_calls: [
+        { name: 'turn_left', args: 'not json at all', id, error: 'Malformed args.' },
+      ],
+    })
+  }
+
+  it('an UNPAIRED malformed call is stripped when the invalid array is the ONLY representation that disagrees', () => {
+    // No `tool_call_chunks`, `.tool_calls` empty, content unchanged. Every other
+    // representation agrees, so this message reaches the strip only because
+    // `invalidChanged` joins the early-return guard. Without that it comes back
+    // as the same instance with the unpaired malformed call still on it — which
+    // is the half-stripped state RC-65 closed for the chunk array.
+    const ai = settledWithInvalid(MALFORMED, [{ type: 'text', text: 'partial' }])
+    // Premises, asserted rather than assumed.
+    expect(ai.tool_calls).toEqual([])
+    expect(hasOwn(ai, 'tool_call_chunks')).toBe(false)
+    expect(ai.invalid_tool_calls?.map((c) => c.id)).toEqual([MALFORMED])
+
+    const [out] = stripUnpairedToolCalls([ai]) as AIMessage[]
+
+    // A copy was taken, which only happens if the invalid-array disagreement
+    // counted as a change at all.
+    expect(out).not.toBe(ai)
+    expect(out.invalid_tool_calls).toEqual([])
+    expect(JSON.stringify(out.invalid_tool_calls)).not.toContain(MALFORMED)
+    expect(JSON.stringify(out.lc_kwargs.invalid_tool_calls)).not.toContain(MALFORMED)
+    // Both serialized forms resolve from that bag, so they must be clean too.
+    expect(JSON.stringify(out.toJSON())).not.toContain(MALFORMED)
+    expect(JSON.stringify(out.toDict())).not.toContain(MALFORMED)
+    // Text content is what keeps the message alive through the drop check.
+    expect(out.content).toEqual([{ type: 'text', text: 'partial' }])
+    // The caller still holds the input; the source must be untouched.
+    expect(ai.invalid_tool_calls?.map((c) => c.id)).toEqual([MALFORMED])
+    expect(JSON.stringify(ai.lc_kwargs)).toContain(MALFORMED)
+    expect(out.lc_kwargs).not.toBe(ai.lc_kwargs)
+  })
+
+  it('DISCRIMINATES: a RESOLVED malformed call keeps its invalid_tool_calls entry', () => {
+    // The guard must discriminate, not just pass: the filter is keyed on
+    // `resolvedIds`, so a malformed call whose `tool_result` is present is
+    // KEPT. Without this, "strip everything" would satisfy the test above.
+    // Two malformed calls: one resolved, one genuinely unpaired — so the
+    // message still changes and the copy path still runs. With only the
+    // resolved one this would pass by identity and prove nothing about the
+    // filter.
+    const ai = new AIMessage({
+      id: 'ai-settled',
+      content: [{ type: 'text', text: 'partial' }],
+      invalid_tool_calls: [
+        { name: 'turn_left', args: 'not json at all', id: MALFORMED, error: 'Malformed args.' },
+        {
+          name: 'turn_right',
+          args: 'also not json',
+          id: 'tc-malformed-unpaired',
+          error: 'Malformed args.',
+        },
+      ],
+    })
+    const result = new ToolMessage({ id: 'tm-mal', content: 'turned', tool_call_id: MALFORMED })
+
+    const out = stripUnpairedToolCalls([ai, result])
+    const outAi = out.find((m) => m.id === 'ai-settled') as AIMessage
+
+    expect(outAi).toBeDefined()
+    // The resolved one survives in the live field AND in the bag; the unpaired
+    // one is gone from both.
+    expect(outAi.invalid_tool_calls?.map((c) => c.id)).toEqual([MALFORMED])
+    expect(JSON.stringify(outAi.lc_kwargs.invalid_tool_calls)).toContain(MALFORMED)
+    expect(JSON.stringify(outAi.lc_kwargs.invalid_tool_calls)).not.toContain(
+      'tc-malformed-unpaired'
+    )
+  })
+
+  it('a WELL-FORMED resolved call is untouched by the fourth-representation filter', () => {
+    // The discrimination that matters most: the new filter must not disturb the
+    // ordinary paired path. Returned BY IDENTITY, with its `tool_result`.
+    const ai = new AIMessage({
+      id: 'ai-ok',
+      content: [{ type: 'text', text: 'Turning now.' }],
+      tool_calls: [{ name: 'turn_left', args: { steps: 1 }, id: 'tc-ok' }],
+    })
+    const result = new ToolMessage({ id: 'tm-ok', content: 'turned', tool_call_id: 'tc-ok' })
+
+    const out = stripUnpairedToolCalls([ai, result])
+
+    expect(out).toHaveLength(2)
+    expect(out[0]).toBe(ai)
+    expect(out[1]).toBe(result)
+  })
+
+  it('DELIBERATE: a PAIRED malformed call keeps its entry and STILL loses its tool_result', () => {
+    // RC-67 resolution (b), and this asserts it rather than leaving it to a
+    // comment. Measured: no input converter of any provider this repo
+    // constructs reads `invalid_tool_calls`, so a malformed call puts no
+    // `tool_use` on the wire — and KEEPING its `tool_result` would emit an
+    // orphan `tool_result`, which is the INVALID_TOOL_RESULTS shape itself.
+    //
+    // Mechanically: `.tool_calls` is empty, so the message takes the identity
+    // return and records nothing into `keptCallIds`; the ToolMessage arm then
+    // drops the result. Reproduced with this fixture before the change and
+    // unchanged by it.
+    const chunk = new AIMessageChunk({
+      id: 'ai-chunk',
+      content: [{ type: 'text', text: 'partial' }],
+      tool_call_chunks: [
+        {
+          name: 'turn_left',
+          args: 'not json at all',
+          id: MALFORMED,
+          index: 0,
+          type: 'tool_call_chunk',
+        },
+      ],
+    })
+    const result = new ToolMessage({ id: 'tm-mal', content: 'turned', tool_call_id: MALFORMED })
+    expect(chunk.tool_calls).toEqual([])
+    expect(chunk.invalid_tool_calls?.map((c) => c.id)).toEqual([MALFORMED])
+
+    const out = stripUnpairedToolCalls([chunk, result])
+
+    // The AI message comes back BY IDENTITY — nothing in any of the four
+    // representations disagreed, because the malformed call's id is resolved.
+    expect(out).toHaveLength(1)
+    expect(out[0]).toBe(chunk)
+    expect(JSON.stringify((out[0] as AIMessageChunk).invalid_tool_calls)).toContain(MALFORMED)
+    // And the `tool_result` is dropped. This is the deliberate half.
+    expect(out.find((m) => (m as ToolMessage).tool_call_id === MALFORMED)).toBeUndefined()
+  })
+
+  it('an AI message left with nothing but a stripped malformed call is dropped entirely', () => {
+    // The new branch `invalidChanged` opens: with EMPTY content and no valid
+    // calls, this message used to leave by the identity return (carrying the
+    // unpaired malformed call), and now falls through to the drop check — where
+    // an AIMessage with no content and no surviving call is dropped, because an
+    // empty AIMessage is itself invalid for Anthropic.
+    const ai = settledWithInvalid(MALFORMED, '')
+    expect(ai.tool_calls).toEqual([])
+
+    const out = stripUnpairedToolCalls([ai])
+
+    expect(out).toEqual([])
+  })
+
+  it('an ID-LESS invalid call is dropped by the same predicate', () => {
+    // A call with no id is one no `tool_result` can ever pair with, so it is
+    // dropped on the same terms as an id-less chunk. Asserted because the
+    // `c.id != null` half of the predicate is otherwise unpinned.
+    const ai = new AIMessage({
+      id: 'ai-settled',
+      content: [{ type: 'text', text: 'partial' }],
+      invalid_tool_calls: [
+        { name: 'turn_left', args: 'not json at all', id: undefined, error: 'Malformed args.' },
+      ],
+    })
+    expect(ai.invalid_tool_calls).toHaveLength(1)
+
+    const [out] = stripUnpairedToolCalls([ai]) as AIMessage[]
+
+    expect(out).not.toBe(ai)
+    expect(out.invalid_tool_calls).toEqual([])
+    expect(out.lc_kwargs.invalid_tool_calls).toEqual([])
+  })
+
+  it('a message that never carried invalid_tool_calls does not ACQUIRE one', () => {
+    // `invalid_tool_calls` is written to the copy and to the bag only when the
+    // source actually carried it. Every message the constructor builds has the
+    // field (it defaults to `[]`), so the shape that can expose an unguarded
+    // write is one rebuilt from the wire — which this repo reads duck-typed
+    // precisely because a class check would reject it (RC-21, RC-58).
+    //
+    // Asserted on OWN-PROPERTY PRESENCE, never on the value: an unguarded
+    // assignment writes the VALUE `undefined`, and reading an ABSENT property
+    // also returns `undefined`, so `toBeUndefined()` would pass either way and
+    // could not fail.
+    const wire = {
+      _getType: () => 'ai' as const,
+      id: 'ai-wire',
+      content: [{ type: 'text', text: 'Turning now.' }],
+      tool_calls: [{ name: 'turn_right', args: { steps: 3 }, id: 'tc-unpaired-wire' }],
+      lc_kwargs: { content: [{ type: 'text', text: 'Turning now.' }], tool_calls: [] },
+    }
+    expect(hasOwn(wire, 'invalid_tool_calls')).toBe(false)
+
+    const [out] = stripUnpairedToolCalls([wire as unknown as BaseMessage]) as AIMessage[]
+
+    // The fixture must take the COPY path, or the assignment never runs and the
+    // assertions below would hold for the wrong reason.
+    expect(out).not.toBe(wire)
+    expect(out.tool_calls).toEqual([])
+
+    // Neither as an own property nor anywhere on the prototype chain.
+    expect(hasOwn(out, 'invalid_tool_calls')).toBe(false)
+    expect('invalid_tool_calls' in out).toBe(false)
+    // And the bag is not given the key either — it carries its own conditional.
+    expect(hasOwn(out.lc_kwargs, 'invalid_tool_calls')).toBe(false)
+    // The keys the strip DOES rewrite are present, so none of the above is
+    // passing on an emptied or unbuilt copy.
+    expect(hasOwn(out.lc_kwargs, 'tool_calls')).toBe(true)
+    expect(hasOwn(out.lc_kwargs, 'content')).toBe(true)
   })
 })
