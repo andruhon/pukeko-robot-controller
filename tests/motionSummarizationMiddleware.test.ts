@@ -1252,6 +1252,45 @@ describe('motionSummarizationMiddleware — RC-64 the whole summarizer pipeline 
     expect(JSON.stringify(out.invalid_tool_calls)).toContain(UNPAIRED)
   })
 
+  it('a plain AIMessage does not ACQUIRE a tool_call_chunks it never had', () => {
+    // `tool_call_chunks` exists only on AIMessageChunk, so the strip writes it
+    // to the copy and to the `lc_kwargs` bag only when the source actually
+    // carried it. Unguarded, a plain AIMessage would come back with an OWN
+    // `tool_call_chunks` property whose value is `undefined` — which changes
+    // what the message serializes to and what a later `concat()` or converter
+    // sees on a shape that never had the field.
+    //
+    // Asserted on OWN-PROPERTY PRESENCE, never on the value: `undefined` is
+    // exactly what an unguarded assignment writes, so `toBeUndefined()` would
+    // pass whether or not the guard is there and could not fail.
+    const ai = new AIMessage({
+      id: 'ai-1',
+      content: [{ type: 'text', text: 'Turning now.' }],
+      tool_calls: [{ name: 'turn_right', args: { steps: 3 }, id: UNPAIRED }],
+      response_metadata: { bridge: 'AIMETAMARKER' },
+    })
+    const hasOwn = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k)
+    expect(hasOwn(ai, 'tool_call_chunks')).toBe(false)
+
+    const [out] = stripUnpairedToolCalls([ai]) as AIMessage[]
+
+    // The fixture must take the COPY path, or the assignment never runs and the
+    // assertions below would hold for the wrong reason.
+    expect(out).not.toBe(ai)
+    expect(collectToolUseIds(out)).toEqual([])
+
+    // Neither as an own property nor anywhere on the prototype chain.
+    expect(hasOwn(out, 'tool_call_chunks')).toBe(false)
+    expect('tool_call_chunks' in out).toBe(false)
+    // And the bag is not given the key either — it carries its own conditional.
+    expect(hasOwn(out.lc_kwargs, 'tool_call_chunks')).toBe(false)
+    // The keys the strip DOES rewrite are present, so none of the above is
+    // passing on an emptied or unbuilt copy.
+    expect(hasOwn(out.lc_kwargs, 'tool_calls')).toBe(true)
+    expect(hasOwn(out.lc_kwargs, 'content')).toBe(true)
+    expect(JSON.stringify(out.lc_kwargs)).toContain('AIMETAMARKER')
+  })
+
   it('CLASS GUARD (HumanMessage): the injected camera turn keeps every field through the pipeline', () => {
     const camera = new HumanMessage({
       id: 'h-1',
