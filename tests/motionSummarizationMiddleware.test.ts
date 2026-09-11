@@ -781,8 +781,9 @@ describe('motionSummarizationMiddleware — RC-30 the image strip preserves the 
 
     // A streamed turn arrives as an AIMessageChunk, which isAIMessage admits and
     // a literal rebuild would flatten into a plain AIMessage. Compared by
-    // prototype, never instanceof: this repo can resolve two copies of
-    // @langchain/core, so a class check is unreliable here (RC-21/RC-58).
+    // prototype, never instanceof: a message rebuilt from the wire carries no
+    // `Symbol.for('langchain.message')` marker, so a class check fails it while
+    // `getType()` answers correctly (RC-21/RC-58).
     const chunk = new AIMessageChunk({
       id: 'ai-chunk',
       content: [{ type: 'text', text: 'partial' }, markedImageBlock()],

@@ -183,7 +183,9 @@ function pruneImageBlocksInHumanMessage(msg: HumanMessage): HumanMessage {
 // `tool_call_chunks` lives only on AIMessageChunk, which `isAIMessage` admits
 // and a literal rebuild would flatten into a plain AIMessage. Copying also
 // keeps the message on the prototype it arrived with, rather than re-minting it
-// under this module's copy of @langchain/core — this repo resolves two.
+// under this module's classes — a rebuild would hand a foreign message this
+// module's prototype and the `Symbol.for('langchain.message')` marker it
+// arrived without, quietly changing what the rest of the pipeline holds.
 //
 // `lc_kwargs` is replaced alongside `additional_kwargs`, on the same terms as the
 // two image strips above and for the same reason: a descriptor clone shares that

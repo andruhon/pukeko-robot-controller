@@ -78,9 +78,9 @@ interface MaybeBlock {
 // The four-type gate is deliberate rather than an artifact of the rebuild: a
 // message of any other type passes through untouched today, and widening that
 // here would be a behaviour change this function was not asked to make. The
-// checks are duck-typed and must stay so — this repo can resolve more than one
-// `@langchain/core`, and a message built by the other copy answers `_getType()`
-// correctly while failing every class check (RC-21, RC-58).
+// checks are duck-typed and must stay so — a message rebuilt from the wire
+// carries no `Symbol.for('langchain.message')` marker, so it answers
+// `_getType()` correctly while failing every class check (RC-21, RC-58).
 //
 // Returns the same instance when nothing changed. The source is never mutated.
 export function stripImageBlocks(msg: BaseMessage): BaseMessage {

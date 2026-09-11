@@ -804,9 +804,9 @@ describe('contextPrunerMiddleware — RC-28 reasoning strip preserves the whole 
       { name: 'turn_left', args: '{"steps":1}', id: 'tc-1', index: 0, type: 'tool_call_chunk' },
     ])
     // Same class as it arrived as — a rebuild would flatten a chunk into a plain
-    // AIMessage. Compared by prototype, never instanceof: this repo resolves two
-    // copies of @langchain/core, so instanceof against an imported message class
-    // is unreliable here.
+    // AIMessage. Compared by prototype, never instanceof: a message rebuilt from
+    // the wire carries no `Symbol.for('langchain.message')` marker, so a class
+    // check fails it while `getType()` answers correctly.
     expect(Object.getPrototypeOf(outChunk)).toBe(Object.getPrototypeOf(chunk))
   })
 
@@ -1029,9 +1029,9 @@ describe('contextPrunerMiddleware — RC-29 ToolMessage image-data strip preserv
     expect(parsed.dataDropped).toBe(true)
     // …and it carried across a field nothing in the implementation mentions.
     expect(readUnnamedField(out)).toEqual({ anything: 'at all' })
-    // Same class it arrived as. Compared by prototype, never instanceof: this
-    // repo resolves two copies of @langchain/core, so an instance check against
-    // an imported message class is unreliable here.
+    // Same class it arrived as. Compared by prototype, never instanceof: a
+    // message rebuilt from the wire carries no `Symbol.for('langchain.message')`
+    // marker, so a class check fails it while `getType()` answers correctly.
     expect(Object.getPrototypeOf(out)).toBe(Object.getPrototypeOf(motionTool))
     // The caller still holds the input array; the source must be untouched.
     expect(motionTool.content as string).toContain(FRAME_BYTES)
@@ -1223,8 +1223,9 @@ describe('contextPrunerMiddleware — RC-29 human image-block prune preserves th
     expect((out.content as Array<{ text?: string }>)[0].text).toBe('Frame 1')
     // …and it carried across a field nothing in the implementation mentions.
     expect(readUnnamedField(out)).toEqual({ anything: 'at all' })
-    // Same class it arrived as — by prototype, never instanceof (dual
-    // @langchain/core in this repo).
+    // Same class it arrived as — by prototype, never instanceof (a message
+    // rebuilt from the wire carries no `Symbol.for('langchain.message')` marker,
+    // so a class check fails it while `getType()` answers correctly).
     expect(Object.getPrototypeOf(out)).toBe(Object.getPrototypeOf(older))
     // Source untouched, and the message that was NOT pruned comes back as the
     // very same object — mechanicalPrune counts strips by reference identity.
@@ -1413,9 +1414,11 @@ describe('contextPrunerMiddleware — RC-29 human image-block prune preserves th
 // breaking the other passes as easily as the original defect did.
 //
 // Message classes are compared by reference or by `getType()`, never
-// `instanceof` and never by prototype identity: this repo resolves two copies
-// of @langchain/core (see the RC-29 header), so both of those silently
-// misjudge a message minted under the other copy.
+// `instanceof` and never by prototype identity: a message rebuilt from the wire
+// carries no `Symbol.for('langchain.message')` marker, so a class check fails it
+// while `getType()` answers correctly — and the marker `instanceof` rests on is
+// a transitive dependency's detail that nothing here pins, which arrived at an
+// unreviewed patch bump and can leave the same way.
 // ───────────────────────────────────────────────────────────────────────────
 describe('contextPrunerMiddleware — RC-27 a session with no motion call still prunes', () => {
   // Threshold = 500 estimated tokens; image blocks charged cheaply so the
@@ -1447,10 +1450,10 @@ describe('contextPrunerMiddleware — RC-27 a session with no motion call still 
   }
 
   // `getType()` is the serialised-field form. A prototype comparison against
-  // RemoveMessage is `instanceof` by another name and carries the same
-  // dual-copy failure mode the repo constraint exists for: this repo resolves
-  // two copies of @langchain/core, and the check would silently evaluate false
-  // for a message minted under the other one.
+  // RemoveMessage is `instanceof` by another name and carries the same failure
+  // mode the repo constraint exists for: a message rebuilt from the wire carries
+  // no `Symbol.for('langchain.message')` marker, so the check would silently
+  // evaluate false for it while `getType()` answers correctly.
   function withoutRemoveMessages(result: unknown): BaseMessage[] {
     return (result as { messages: BaseMessage[] }).messages.filter(
       (m) => m.getType() !== 'remove'
@@ -1991,8 +1994,10 @@ describe('contextPrunerMiddleware — RC-27 a session with no motion call still 
 // the boundary to a point whose tail is already proven under the threshold.
 //
 // Message classes are compared by reference or `getType()`, never `instanceof`
-// and never by prototype identity — this repo resolves two copies of
-// @langchain/core.
+// and never by prototype identity — a message rebuilt from the wire carries no
+// `Symbol.for('langchain.message')` marker, so a class check fails it while
+// `getType()` answers correctly, and the marker `instanceof` rests on is a
+// transitive dependency's detail that nothing here pins.
 // ───────────────────────────────────────────────────────────────────────────
 describe('contextPrunerMiddleware — RC-56 a failed motion keeps the frame the strip kept', () => {
   const OVER_THRESHOLD = {
@@ -2547,7 +2552,9 @@ describe('contextPrunerMiddleware — RC-56 a failed motion keeps the frame the 
 // Sessions are driven as loops over the real rewrite, fed back, because the
 // failure is a feedback property that a single-call boundary assertion cannot
 // see. Message classes are compared by reference or `getType()`, never
-// `instanceof`: this repo resolves two copies of @langchain/core.
+// `instanceof`: a message rebuilt from the wire carries no
+// `Symbol.for('langchain.message')` marker, so a class check fails it while
+// `getType()` answers correctly.
 // ───────────────────────────────────────────────────────────────────────────
 describe('contextPrunerMiddleware — RC-60 an early motion call must not pin the boundary', () => {
   const OVER_THRESHOLD = {
@@ -3218,7 +3225,8 @@ describe('contextPrunerMiddleware — RC-60 an early motion call must not pin th
 // source so that mutating one cannot red another.
 //
 // Message classes are compared by reference or `getType()`, never `instanceof`:
-// this repo resolves two copies of @langchain/core.
+// a message rebuilt from the wire carries no `Symbol.for('langchain.message')`
+// marker, so a class check fails it while `getType()` answers correctly.
 // ───────────────────────────────────────────────────────────────────────────
 describe('contextPrunerMiddleware — RC-59 the anchor label names the cause that fired', () => {
   const OVER_THRESHOLD = {

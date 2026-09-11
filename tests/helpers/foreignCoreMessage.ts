@@ -1,13 +1,14 @@
 // RC-58 — message fixtures that do NOT come from the `@langchain/core` copy this
 // repo imports.
 //
-// Why these exist. The robot can resolve more than one `@langchain/core` at
-// runtime: its own, plus whatever the `@gaunt-sloth/*` dependencies pull in. A
-// message built inside gaunt-sloth's AG-UI pipeline is therefore not necessarily
-// an instance of the class this repo imports, and RC-21 is where that cost a real
+// Why these exist. A message that arrives from gaunt-sloth's AG-UI pipeline is
+// not necessarily an instance of the class this repo imports: one rebuilt from
+// the wire carries no `Symbol.for('langchain.message')` marker, so a class check
+// fails it while `getType()` answers correctly. RC-21 is where that cost a real
 // bug — `msg instanceof ToolMessage` returned false for every capture result on
 // the live server, no frame was ever injected, and the dumps read
-// `tool-data:1 / human-images:0 / imageCount:0`. Production is duck-typed as a
+// `tool-data:1 / human-images:0 / imageCount:0`, measured when two copies of
+// `@langchain/core` genuinely coexisted. Production is duck-typed as a
 // result (`isToolMessage`, `isHumanMessage`, `getType()`), and that constraint is
 // non-negotiable.
 //

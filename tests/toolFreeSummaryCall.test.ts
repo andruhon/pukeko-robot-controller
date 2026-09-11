@@ -47,9 +47,10 @@ interface HookContainer {
   wrapModelCall?: unknown
 }
 
-// Duck-typed, not `instanceof RemoveMessage`: two copies of @langchain/core are
-// installed in this repo, so an `instanceof` across the boundary can silently
-// become a no-op filter.
+// Duck-typed, not `instanceof RemoveMessage`: a message rebuilt from the wire
+// carries no `Symbol.for('langchain.message')` marker, so a class check fails it
+// while `getType()` answers correctly, and this filter would silently become a
+// no-op.
 function isRemoveMessage(m: BaseMessage): boolean {
   return (m as { getType?: () => string }).getType?.() === 'remove'
 }
