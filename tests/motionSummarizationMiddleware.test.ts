@@ -1605,8 +1605,15 @@ describe('motionSummarizationMiddleware — RC-67 invalid_tool_calls, the fourth
 
   it('an ID-LESS invalid call is dropped by the same predicate', () => {
     // A call with no id is one no `tool_result` can ever pair with, so it is
-    // dropped on the same terms as an id-less chunk. Asserted because the
-    // `c.id != null` half of the predicate is otherwise unpinned.
+    // dropped on the same terms as an id-less chunk.
+    //
+    // This pins the BEHAVIOUR, not the `c.id != null` clause that appears to
+    // produce it — measured, because the distinction matters to anyone editing
+    // the predicate. Deleting that clause leaves this test green: `resolvedIds`
+    // is built under `if (id)` so it can never hold a nullish id, which makes
+    // `resolvedIds.has(undefined)` false on its own. The clause is deliberate
+    // redundancy mirroring the chunk predicate, and no mutation of it can red a
+    // test, so do not read this test as protecting it.
     const ai = new AIMessage({
       id: 'ai-settled',
       content: [{ type: 'text', text: 'partial' }],

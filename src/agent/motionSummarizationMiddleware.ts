@@ -216,7 +216,13 @@ export function stripUnpairedToolCalls(messages: BaseMessage[]): BaseMessage[] {
       // ACQUIRE the key. A class check is forbidden here anyway (RC-21, RC-58).
       //
       // An id-less invalid call is dropped by the same predicate, as a call no
-      // `tool_result` can ever pair with.
+      // `tool_result` can ever pair with. The `c.id != null` half of that
+      // predicate is deliberate redundancy, mirroring the chunk predicate
+      // above: `resolvedIds` is built under `if (id)` and so can never hold a
+      // nullish id, which means `resolvedIds.has(undefined)` is already false
+      // and removing the clause changes no behaviour. Measured, and recorded
+      // here because a reader who assumes it is load-bearing will look for a
+      // test that pins it and find none.
       const invalid = ai.invalid_tool_calls;
       const keptInvalid = invalid?.filter((c) => c.id != null && resolvedIds.has(c.id));
       const invalidChanged = invalid !== undefined && (keptInvalid?.length ?? 0) !== invalid.length;
