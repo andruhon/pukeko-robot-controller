@@ -1040,6 +1040,7 @@ describe('motionSummarizationMiddleware — RC-30 the image strip preserves the 
 describe('motionSummarizationMiddleware — RC-64 the whole summarizer pipeline preserves the message', () => {
   const FRAME_BYTES = 'PIPELINEFRAMEMARKER'
   const UNPAIRED = 'tc-unpaired-motion'
+  const PAIRED = 'tc-paired-motion'
   const PROMPT = 'SUMMARY PROMPT'
 
   function stampUnnamedField(msg: BaseMessage, value: unknown): void {
@@ -1112,37 +1113,143 @@ describe('motionSummarizationMiddleware — RC-64 the whole summarizer pipeline 
     expect(out).not.toBe(motionAi)
   })
 
-  it('CLASS GUARD (AIMessage, streamed): a chunk stays a chunk and keeps its tool_call_chunks through both stages', () => {
+  it('CLASS GUARD (AIMessage, streamed): the strip clears the unpaired call from tool_call_chunks too, while a PAIRED chunk survives', () => {
     // A streamed turn arrives as an AIMessageChunk, which isAIMessage admits and
     // a literal rebuild flattened into a plain AIMessage. Compared by prototype
     // against the input, never against a class.
+    //
+    // `tool_call_chunks` is the THIRD representation of a tool call, and the
+    // strip has to reach it: `toJSON()`, `toDict()` and `concat()` all resolve
+    // the call from there or from the `lc_kwargs` bag, so a strip that clears
+    // only `.tool_calls` puts the unpaired call straight back into anything
+    // that serializes the summarizer input (RC-65).
+    //
+    // TWO chunks, one resolved and one not, because the assertion has to
+    // DISCRIMINATE: a guard that only checked the unpaired one would be passed
+    // by a function that stripped the field wholesale.
     const chunk = new AIMessageChunk({
       id: 'ai-chunk',
       content: [{ type: 'text', text: 'partial' }, markedImageBlock()],
       tool_call_chunks: [
-        { name: 'turn_left', args: '{"steps":1}', id: UNPAIRED, index: 0, type: 'tool_call_chunk' },
+        { name: 'turn_left', args: '{"steps":1}', id: PAIRED, index: 0, type: 'tool_call_chunk' },
+        { name: 'turn_right', args: '{"steps":2}', id: UNPAIRED, index: 1, type: 'tool_call_chunk' },
       ],
       usage_metadata: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
     })
     stampUnnamedField(chunk, { anything: 'at all' })
-    // The chunk's own constructor collapsed the chunk into a live tool call, so
-    // the second stage has something to strip.
-    expect(collectToolUseIds(chunk)).toEqual([UNPAIRED])
+    const pairedResult = new ToolMessage({
+      id: 'tm-paired',
+      content: 'turn_left done',
+      tool_call_id: PAIRED,
+      name: 'turn_left',
+    })
+    // The chunk's own constructor collapsed both chunks into live tool calls
+    // keeping their ids, so the second stage has something to strip and
+    // something to keep.
+    expect(collectToolUseIds(chunk)).toEqual([PAIRED, UNPAIRED])
+    expect(chunk.tool_call_chunks?.map((c) => c.id)).toEqual([PAIRED, UNPAIRED])
 
-    const built = buildSummarizationMessages([opener(), chunk], PROMPT)
+    const built = buildSummarizationMessages([opener(), chunk, pairedResult], PROMPT)
     const out = built.find((m) => m.id === 'ai-chunk') as AIMessageChunk
     expect(out).toBeDefined()
 
     expect(hasImage(out.content)).toBe(false)
-    expect(collectToolUseIds(out)).toEqual([])
+    // The paired call survives in `.tool_calls`; the unpaired one is gone.
+    expect(collectToolUseIds(out)).toEqual([PAIRED])
     expect(readUnnamedField(out)).toEqual({ anything: 'at all' })
     expect(Object.getPrototypeOf(out)).toBe(Object.getPrototypeOf(chunk))
-    // Carried across whole, as every field the function does not rewrite is.
+
+    // The third representation is filtered on the same ids, and the guard
+    // discriminates: the paired chunk is still here, the unpaired one is not.
     expect(out.tool_call_chunks).toEqual([
-      { name: 'turn_left', args: '{"steps":1}', id: UNPAIRED, index: 0, type: 'tool_call_chunk' },
+      { name: 'turn_left', args: '{"steps":1}', id: PAIRED, index: 0, type: 'tool_call_chunk' },
     ])
+
+    // The unpaired call is unreachable through the copy in each representation
+    // this function filters — the live field, the shared `lc_kwargs` bag, and
+    // both serialized forms that resolve from it — while the paired call is
+    // still reachable in every one of them, so none of these can be passing on
+    // an emptied or absent field.
+    for (const [what, value] of [
+      ['tool_call_chunks', out.tool_call_chunks],
+      ['lc_kwargs', out.lc_kwargs],
+      ['toJSON()', out.toJSON()],
+      ['toDict()', out.toDict()],
+    ] as Array<[string, unknown]>) {
+      expect(JSON.stringify(value), `${what} must not carry the unpaired call`).not.toContain(
+        UNPAIRED
+      )
+      expect(JSON.stringify(value), `${what} must still carry the paired call`).toContain(PAIRED)
+    }
+
+    // The node's stated forward risk: `concat()` rebuilds `.tool_calls` from
+    // `tool_call_chunks`, so an unstripped chunk array resurrects the unpaired
+    // call in a merged message even though the copy's `.tool_calls` looked clean.
+    const merged = out.concat(new AIMessageChunk({ content: '' }))
+    expect(JSON.stringify(merged.tool_calls)).not.toContain(UNPAIRED)
+    expect(JSON.stringify(merged.tool_call_chunks)).not.toContain(UNPAIRED)
+    expect(JSON.stringify(merged.tool_calls)).toContain(PAIRED)
+
+    // Every field the function does not rewrite is still carried across whole.
     expect(out.usage_metadata).toEqual({ input_tokens: 3, output_tokens: 2, total_tokens: 5 })
     expect(out).not.toBe(chunk)
+
+    // The caller still holds the input array; the source must be untouched, in
+    // the live field and in its own bag.
+    expect(chunk.tool_call_chunks?.map((c) => c.id)).toEqual([PAIRED, UNPAIRED])
+    expect(JSON.stringify(chunk.lc_kwargs)).toContain(UNPAIRED)
+    expect(out.lc_kwargs).not.toBe(chunk.lc_kwargs)
+
+    // The paired call's own result survived too, so the fixture really did take
+    // the keep branch rather than dropping the pair wholesale.
+    expect(built.find((m) => m.id === 'tm-paired')).toBe(pairedResult)
+  })
+
+  it('a chunk is stripped even when tool_call_chunks is the ONLY representation that disagrees', () => {
+    // When a streamed chunk's `args` are unparseable the constructor routes the
+    // call to `invalid_tool_calls` and leaves `.tool_calls` EMPTY. So
+    // `keptCalls.length === calls.length` holds, the content is unchanged, and
+    // the chunk array is the only representation carrying the unpaired call —
+    // the case that decides whether the early "nothing changed" return has to
+    // consider the third representation. Without that, this message comes back
+    // as the same instance with the unpaired chunk still on it.
+    const chunk = new AIMessageChunk({
+      id: 'ai-chunk',
+      content: [{ type: 'text', text: 'partial' }],
+      tool_call_chunks: [
+        {
+          name: 'turn_left',
+          args: 'not json at all',
+          id: UNPAIRED,
+          index: 0,
+          type: 'tool_call_chunk',
+        },
+      ],
+    })
+    // The premise of the fixture, asserted rather than assumed: nothing for the
+    // `.tool_calls` filter to do.
+    expect(chunk.tool_calls).toEqual([])
+    expect(chunk.tool_call_chunks?.map((c) => c.id)).toEqual([UNPAIRED])
+
+    const [out] = stripUnpairedToolCalls([chunk]) as AIMessageChunk[]
+
+    // A copy was taken, which only happens if the chunk disagreement counted as
+    // a change at all.
+    expect(out).not.toBe(chunk)
+    expect(JSON.stringify(out.tool_call_chunks)).not.toContain(UNPAIRED)
+    expect(JSON.stringify(out.lc_kwargs.tool_call_chunks)).not.toContain(UNPAIRED)
+    // Text content is what keeps the message alive through the drop check.
+    expect(out.content).toEqual([{ type: 'text', text: 'partial' }])
+    // The source is untouched.
+    expect(chunk.tool_call_chunks?.map((c) => c.id)).toEqual([UNPAIRED])
+
+    // KNOWN RESIDUAL, pinned deliberately so it is found rather than
+    // rediscovered: a malformed call keeps its id in `invalid_tool_calls`, a
+    // FOURTH representation this function does not filter. Narrowing that is a
+    // behaviour change beyond this strip — it would also have to decide whether
+    // such a call's `tool_result` may be kept — so it is left to its own node.
+    // This assertion is what will red when that node lands.
+    expect(JSON.stringify(out.invalid_tool_calls)).toContain(UNPAIRED)
   })
 
   it('CLASS GUARD (HumanMessage): the injected camera turn keeps every field through the pipeline', () => {
