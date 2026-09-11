@@ -23,43 +23,24 @@ name: Unit tests
 #
 # WHY THE SAME JOB, NOT A PARALLEL ONE. A parallel job is a second independently
 # named check, and each name has to be added to branch protection separately —
-# operational cost paid by a human, for no extra coverage. Here it would also have
-# to duplicate this job's entire two-repository setup: both checkouts, corepack,
-# node, two installs and the vue-ui build, roughly doubling the CI time and
-# creating a second place to keep in sync with the coupling described below. The
-# price of a single job is fail-fast: an earlier failure masks a later one until
-# it is fixed, which is acceptable for a gate whose purpose is to stop the merge
-# either way.
+# operational cost paid by a human, for no extra coverage. It would also repeat
+# this job's whole setup — checkout, corepack, node, install — and so roughly
+# double the CI time. The price of a single job is fail-fast: an earlier failure
+# masks a later one until it is fixed, which is acceptable for a gate whose
+# purpose is to stop the merge either way.
 #
 # The build runs AFTER `pnpm test`, because the QA-19 guard is the first link of
 # that chained command and must stay the first thing this job runs — a job that
 # type-checks before it checks for one-shot package runners has put the cheap
 # convenience ahead of the reason the trigger exists.
 #
-# WHY THIS JOB CHECKS OUT TWO REPOSITORIES. pnpm-workspace.yaml carries the
-# temporary PLAT-22 override redirecting @galvanized-pukeko/vue-ui to
-# `file:../galvanized-pukeko/packages/galvanized-pukeko-vue-ui`, and pnpm-lock.yaml
-# records it as a directory resolution. Without that directory on disk,
-# `pnpm install --frozen-lockfile` here fails with ENOENT before a single test
-# runs — measured, not inferred. So galvanized-pukeko is checked out beside this
-# repository and its vue-ui package is built first: a file: dependency packs
-# without its dist/ when the target is unbuilt, and vue-ui's entry point lives in
-# dist/, so an unbuilt sibling surfaces later as a module-not-found that reads
-# like a code error and is not one.
-#
-# The consequence is a real coupling, and it should be weighed rather than
-# absorbed: a green tick here is no longer a statement about this repository
-# alone. It also asserts that galvanized-pukeko main installs and builds vue-ui.
-# When the PLAT-22 redirect is dropped and this repository takes a published
-# @galvanized-pukeko/vue-ui from the registry again, delete the second checkout
-# and the two galvanized steps; the rest of this job then matches
-# galvanized-pukeko's own unit-tests.yml exactly.
-#
-# The build step deepens that coupling rather than merely inheriting it: vue-tsc
-# resolves @galvanized-pukeko/vue-ui to the sibling checkout's GENERATED
-# dist/index.d.ts, so this repository's type-check now runs against
-# galvanized-pukeko main's types rather than against the published version this
-# package.json pins. A breaking type change landing there turns this job red.
+# WHY ONE CHECKOUT IS ENOUGH. This job checks out this repository alone and
+# installs it. @galvanized-pukeko/vue-ui comes from the public registry at the
+# version package.json pins: pnpm-lock.yaml records a registry resolution with
+# an integrity hash, and pnpm-workspace.yaml has no override redirecting it to a
+# directory. So do not add a second checkout of galvanized-pukeko here. It would
+# install and build a package this job never resolves, and it would make a green
+# tick depend on an unrelated repository's main branch being installable.
 #
 # WHAT THIS CHECK DOES NOT COVER. A green tick here is narrower than "CI passed":
 #   - No type-checking of the tooling JavaScript. tsconfig.tooling.json sets
@@ -98,16 +79,6 @@ jobs:
     steps:
       - name: Check out pukeko-robot-controller
         uses: actions/checkout@v6
-        with:
-          path: pukeko-robot-controller
-      # Must land inside GITHUB_WORKSPACE, so both repositories sit in
-      # subdirectories and the file: path above resolves between them.
-      - name: Check out the galvanized-pukeko sibling
-        uses: actions/checkout@v6
-        with:
-          repository: pukeko-robotics/galvanized-pukeko
-          ref: main
-          path: galvanized-pukeko
       - name: Enable Corepack
         run: corepack enable
       - name: Use Node.js ${{ matrix.node-version }}
@@ -115,21 +86,10 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'pnpm'
-          cache-dependency-path: |
-            pukeko-robot-controller/pnpm-lock.yaml
-            galvanized-pukeko/pnpm-lock.yaml
-      - name: Install galvanized-pukeko
-        working-directory: galvanized-pukeko
-        run: pnpm install --frozen-lockfile
-      - name: Build vue-ui
-        working-directory: galvanized-pukeko
-        run: pnpm --filter @galvanized-pukeko/vue-ui build
+          cache-dependency-path: pnpm-lock.yaml
       - name: Install dependencies
-        working-directory: pukeko-robot-controller
         run: pnpm install --frozen-lockfile
       - name: Run Tests
-        working-directory: pukeko-robot-controller
         run: pnpm test
       - name: Build
-        working-directory: pukeko-robot-controller
         run: pnpm run build
